@@ -1,0 +1,18 @@
+{
+  "subjects": [
+    "Biologie",
+    "Chemie",
+    "Deutsch",
+    "Englisch",
+    "Geografie",
+    "Mathematik",
+    "Physik",
+    "Sachkunde",
+    "Sachunterricht"
+  ],
+  "aliases": {
+    "Mathe": "Mathematik",
+    "Bio": "Biologie",
+    "Geo": "Geografie"
+  }
+}
