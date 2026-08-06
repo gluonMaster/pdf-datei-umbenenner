@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import time
 import os
+from datetime import datetime
 
 # Добавляем текущую директорию в путь для импорта модулей
 if getattr(sys, 'frozen', False):
@@ -19,9 +20,12 @@ else:
 sys.path.insert(0, application_path)
 
 from pdf_extractor import PDFExtractor
-from text_parser import TextParser
-from validator import Validator, ValidationLevel
+from form_parser import FormParser
+from validator import Validator
 from file_renamer import FileRenamer
+from processing_service import DocumentProcessingService, PlannedAction
+from review_queue import ReviewStore
+from student_registry import StudentRegistry
 
 
 class SimplePDFRenamerGUI:
@@ -35,14 +39,25 @@ class SimplePDFRenamerGUI:
         # Переменные
         self.selected_folder = tk.StringVar()
         self.dry_run_mode = tk.BooleanVar(value=False)
+        self.selected_month = tk.IntVar(value=1)
         self.progress_var = tk.DoubleVar()
         self.processing = False
         
         # Компоненты
         self.extractor = PDFExtractor()
-        self.parser = TextParser()
+        self.parser = FormParser()
         self.validator = Validator()
         self.renamer = FileRenamer()
+        self.review_store = ReviewStore()
+        self.student_registry = StudentRegistry(Path(application_path) / "Schuler.csv")
+        self.processing_service = DocumentProcessingService(
+            extractor=self.extractor,
+            parser=self.parser,
+            student_registry=self.student_registry,
+            validator=self.validator,
+            review_store=self.review_store,
+            renamer=self.renamer,
+        )
         
         # Статистика
         self.stats = {'total': 0, 'success': 0, 'warning': 0, 'manual': 0, 'error': 0}
@@ -133,6 +148,8 @@ class SimplePDFRenamerGUI:
         folder = filedialog.askdirectory(title="Waehlen Sie den Ordner mit PDF-Dateien")
         if folder:
             self.selected_folder.set(folder)
+            self.review_store.store_path = Path(folder) / "manual_review.json"
+            self.review_store.load()
             self.log_message(f"Ordner ausgewaehlt: {folder}")
     
     def log_message(self, message):
@@ -217,6 +234,8 @@ Fehler: {self.stats['error']}"""
             folder_path = Path(self.selected_folder.get())
             dry_run = self.dry_run_mode.get()
             manual_check_folder = folder_path / "manual_check"
+            self.processing_service.manual_review_folder = manual_check_folder
+            self.renamer.reset_reservations()
             
             self.log_message("=" * 50)
             self.log_message("PDF Datei Umbenenner gestartet")
@@ -231,7 +250,7 @@ Fehler: {self.stats['error']}"""
             # PDF-Dateien finden
             pdf_files = []
             for file_path in folder_path.iterdir():
-                if file_path.is_file() and self.extractor.is_valid_pdf(file_path):
+                if file_path.is_file() and file_path.suffix.casefold() == ".pdf":
                     pdf_files.append(file_path)
             
             pdf_files = sorted(pdf_files)
@@ -268,6 +287,8 @@ Fehler: {self.stats['error']}"""
             if self.processing:
                 self.progress_var.set(100)
                 self.progress_label.config(text="Verarbeitung abgeschlossen!")
+                if self.review_store.count() > 0 and not dry_run:
+                    self.review_store.save()
                 self.show_final_report()
             
         except Exception as e:
@@ -280,63 +301,33 @@ Fehler: {self.stats['error']}"""
             self.stop_btn.config(state=tk.DISABLED)
     
     def process_single_file(self, pdf_path, manual_check_folder, dry_run):
-        """Обрабатываем один файл"""
+        """Показываем результат центрального сервиса."""
         self.log_message(f"Verarbeite: {pdf_path.name}")
-        
-        # Извлекаем текст
-        text = self.extractor.extract_first_lines(pdf_path)
-        if not text:
-            self.log_message(f"  FEHLER: Text konnte nicht extrahiert werden")
+
+        self.processing_service.manual_review_folder = Path(manual_check_folder)
+        result = self.processing_service.process_document(
+            pdf_path,
+            self.selected_month.get(),
+            datetime.now().year,
+            dry_run,
+        )
+        if result.error:
             self.stats['error'] += 1
-            return
-        
-        # Парсим
-        student_name, subject = self.parser.parse_document(text)
-        
-        # Валидируем
-        validation_result = self.validator.validate_document_data(student_name, subject)
-        
-        if validation_result.level == ValidationLevel.MANUAL_CHECK:
+            self.log_message(f"  FEHLER: {result.error}")
+        elif result.planned_action == PlannedAction.MANUAL_REVIEW:
             self.stats['manual'] += 1
-            
-            if not dry_run:
-                self.renamer.move_to_folder(pdf_path, manual_check_folder)
-                self.log_message(f"  Verschoben nach: {manual_check_folder.name}/")
-            else:
-                self.log_message(f"  [Simulation] Wuerde verschoben nach: {manual_check_folder.name}/")
-            
-            self.log_message(f"  WARNUNG: {validation_result.message}")
-            return
-        
-        # Переименовываем
-        if student_name and subject:
-            surname, name = student_name.split()
-            new_filename = self.renamer.generate_new_filename(surname, name, subject)
-            new_path = pdf_path.parent / new_filename
-            
-            self.log_message(f"  Name: {student_name}")
-            self.log_message(f"  Fach: {subject}")
-            
-            if validation_result.level == ValidationLevel.WARNING:
-                self.stats['warning'] += 1
-                self.log_message(f"  WARNUNG: {validation_result.message}")
-            
-            success = self.renamer.rename_file(pdf_path, new_path, dry_run)
-            
-            if success:
-                if validation_result.level == ValidationLevel.VALID:
-                    self.stats['success'] += 1
-                
-                if dry_run:
-                    self.log_message(f"  [Simulation] {pdf_path.name} -> {new_filename}")
-                else:
-                    self.log_message(f"  Umbenannt: {pdf_path.name} -> {new_filename}")
-            else:
-                self.stats['error'] += 1
-                self.log_message(f"  FEHLER beim Umbenennen")
+            prefix = "[Simulation] " if dry_run else ""
+            self.log_message(f"  {prefix}Manuelle Pruefung: {result.review_item.reason}")
+            self.log_message(f"  Ziel: {result.planned_path}")
         else:
-            self.stats['error'] += 1
-            self.log_message(f"  FEHLER: Name oder Fach nicht ermittelt")
+            if result.warnings:
+                self.stats['warning'] += 1
+                for warning in result.warnings:
+                    self.log_message(f"  WARNUNG: {warning}")
+            else:
+                self.stats['success'] += 1
+            prefix = "[Simulation] " if dry_run else ""
+            self.log_message(f"  {prefix}{pdf_path.name} -> {result.planned_name}")
     
     def show_final_report(self):
         """Финальный отчет"""

@@ -20,10 +20,12 @@ class ValidationLevel(Enum):
 class ValidationResult:
     """Результат валидации"""
     
-    def __init__(self, level: ValidationLevel, message: str = "", suggestions: Optional[List[str]] = None):
+    def __init__(self, level: ValidationLevel, message: str = "", suggestions: Optional[List[str]] = None,
+                 canonical_value: Optional[str] = None):
         self.level = level
         self.message = message
         self.suggestions = suggestions or []  # Список подсказок для исправления
+        self.canonical_value = canonical_value
     
     def is_valid(self) -> bool:
         """Можно ли автоматически переименовать файл"""
@@ -68,9 +70,8 @@ class Validator:
                 with open(cls._config_path, 'r', encoding='utf-8') as f:
                     cls._subjects_cache = json.load(f)
             else:
-                # Создаем файл с дефолтной конфигурацией
-                with open(cls._config_path, 'w', encoding='utf-8') as f:
-                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+                # Чтение конфигурации не должно иметь побочных эффектов (важно
+                # для dry-run); запись выполняется только явными редакторами.
                 cls._subjects_cache = default_config
         except (json.JSONDecodeError, IOError) as e:
             # В случае ошибки используем дефолтную конфигурацию
@@ -205,7 +206,10 @@ class Validator:
                 "Fach nicht gefunden"
             )
         
-        valid_subjects = cls.get_valid_subjects()
+        config = cls._load_subjects_config()
+        canonical_subjects = config.get("subjects", [])
+        aliases = config.get("aliases", {})
+        valid_subjects = canonical_subjects + list(aliases.keys())
         if subject not in valid_subjects:
             # Получаем подсказки для неизвестной дисциплины
             suggestions = cls.suggest_subjects(subject, limit=5)
@@ -216,7 +220,10 @@ class Validator:
                 suggestions=suggestions
             )
         
-        return ValidationResult(ValidationLevel.VALID)
+        return ValidationResult(
+            ValidationLevel.VALID,
+            canonical_value=aliases.get(subject, subject),
+        )
     
     @classmethod
     def validate_document_data(cls, name: Optional[str], 
@@ -247,7 +254,8 @@ class Validator:
             return ValidationResult(
                 ValidationLevel.MANUAL_CHECK,
                 "; ".join(messages),
-                suggestions=subject_result.suggestions
+                suggestions=subject_result.suggestions,
+                canonical_value=subject_result.canonical_value,
             )
         
         # Если есть предупреждения
@@ -261,7 +269,11 @@ class Validator:
             
             return ValidationResult(
                 ValidationLevel.WARNING,
-                "; ".join(messages) if messages else ""
+                "; ".join(messages) if messages else "",
+                canonical_value=subject_result.canonical_value,
             )
         
-        return ValidationResult(ValidationLevel.VALID)
+        return ValidationResult(
+            ValidationLevel.VALID,
+            canonical_value=subject_result.canonical_value,
+        )

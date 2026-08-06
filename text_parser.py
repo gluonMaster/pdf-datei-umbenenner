@@ -29,7 +29,7 @@ class TextParser:
             AliasManager
         """
         if cls._alias_manager is None:
-            cls._alias_manager = AliasManager()
+            cls._alias_manager = AliasManager(create_if_missing=False)
         return cls._alias_manager
     
     @classmethod
@@ -63,9 +63,7 @@ class TextParser:
                 with open(cls._config_path, 'r', encoding='utf-8') as f:
                     cls._subjects_cache = json.load(f)
             else:
-                # Создаем файл с дефолтной конфигурацией
-                with open(cls._config_path, 'w', encoding='utf-8') as f:
-                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+                # Парсинг, особенно dry-run, является только чтением.
                 cls._subjects_cache = default_config
         except (json.JSONDecodeError, IOError) as e:
             # В случае ошибки используем дефолтную конфигурацию

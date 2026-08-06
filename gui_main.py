@@ -12,10 +12,12 @@ import json
 from datetime import datetime
 
 from pdf_extractor import PDFExtractor
-from text_parser import TextParser
-from validator import Validator, ValidationLevel
+from form_parser import FormParser
+from validator import Validator
 from file_renamer import FileRenamer
-from review_queue import ReviewStore, ReviewItem
+from review_queue import ReviewStore
+from processing_service import DocumentProcessingService, PlannedAction
+from student_registry import StudentRegistry
 from alias_manager import AliasManager
 from file_opener import FileOpener
 
@@ -38,11 +40,20 @@ class PDFRenamerGUI:
         
         # Komponenten
         self.extractor = PDFExtractor()
-        self.parser = TextParser()
+        self.parser = FormParser()
         self.validator = Validator()
         self.renamer = FileRenamer()
         self.review_store = ReviewStore()
-        self.alias_manager = AliasManager()  # Менеджер алиасов для автообучения
+        self.student_registry = StudentRegistry(Path(__file__).parent / "Schuler.csv")
+        self.processing_service = DocumentProcessingService(
+            extractor=self.extractor,
+            parser=self.parser,
+            student_registry=self.student_registry,
+            validator=self.validator,
+            review_store=self.review_store,
+            renamer=self.renamer,
+        )
+        self.alias_manager = AliasManager(create_if_missing=False)
         
         # Загрузить список дисциплин из конфига
         self.subjects = []
@@ -503,20 +514,11 @@ class PDFRenamerGUI:
         month = self.selected_month.get()
         year = datetime.now().year
         
-        # Генерируем новое имя файла
-        new_filename = self.renamer.generate_new_filename(surname, name, subject, month, year)
-        # Целевая папка — корневая (base_folder), а не manual_check
-        target_path = base_folder / new_filename
-        
-        # Обработка коллизий: если файл существует, добавляем счетчик
-        if target_path.exists():
-            stem = target_path.stem
-            suffix = target_path.suffix
-            counter = 1
-            while target_path.exists():
-                new_filename = f"{stem}_{counter}{suffix}"
-                target_path = base_folder / new_filename
-                counter += 1
+        # Тот же планировщик коллизий используется в обычной обработке.
+        target_path = self.renamer.plan_new_path(
+            base_folder, surname, name, subject, month, year, source_path=file_path
+        )
+        new_filename = target_path.name
         
         # Переместить и переименовать файл из manual_check в корневую папку
         try:
@@ -626,19 +628,16 @@ class PDFRenamerGUI:
             month = self.selected_month.get()
             year = datetime.now().year
             
-            # Генерируем новое имя файла
-            new_filename = self.renamer.generate_new_filename(item_surname, item_name, subject, month, year)
-            target_path = base_folder / new_filename
-            
-            # Обработка коллизий
-            if target_path.exists():
-                stem = target_path.stem
-                suffix = target_path.suffix
-                counter = 1
-                while target_path.exists():
-                    new_filename = f"{stem}_{counter}{suffix}"
-                    target_path = base_folder / new_filename
-                    counter += 1
+            target_path = self.renamer.plan_new_path(
+                base_folder,
+                item_surname,
+                item_name,
+                subject,
+                month,
+                year,
+                source_path=file_path,
+            )
+            new_filename = target_path.name
             
             # Переместить и переименовать файл
             try:
@@ -765,6 +764,8 @@ class PDFRenamerGUI:
             folder_path = Path(self.selected_folder.get())
             dry_run = self.dry_run_mode.get()
             manual_check_folder = folder_path / "manual_check"
+            self.processing_service.manual_review_folder = manual_check_folder
+            self.renamer.reset_reservations()
             
             self.log_message("=" * 60)
             self.log_message("📁 PDF Datei Umbenenner gestartet")
@@ -781,7 +782,7 @@ class PDFRenamerGUI:
             # PDF-Dateien finden
             pdf_files = []
             for file_path in folder_path.iterdir():
-                if file_path.is_file() and self.extractor.is_valid_pdf(file_path):
+                if file_path.is_file() and file_path.suffix.casefold() == ".pdf":
                     pdf_files.append(file_path)
             
             pdf_files = sorted(pdf_files)
@@ -837,100 +838,40 @@ class PDFRenamerGUI:
             self.stop_button.config(state=tk.DISABLED)
     
     def process_single_file(self, pdf_path, manual_check_folder, dry_run):
-        """Verarbeitet eine einzelne PDF-Datei"""
+        """Stellt ein Ergebnis des zentralen Service im GUI dar."""
         self.log_message(f"📄 Verarbeite: {pdf_path.name}")
-        
-        # Text extrahieren
-        text = self.extractor.extract_first_lines(pdf_path)
-        if not text:
-            self.log_message(f"   ❌ Text konnte nicht extrahiert werden")
+
+        self.processing_service.manual_review_folder = Path(manual_check_folder)
+        result = self.processing_service.process_document(
+            pdf_path,
+            self.selected_month.get(),
+            datetime.now().year,
+            dry_run,
+        )
+        if result.error:
             self.stats['error'] += 1
-            return
-        
-        # Namen und Fach parsen
-        student_name, subject = self.parser.parse_document(text)
-        
-        # Validierung
-        validation_result = self.validator.validate_document_data(student_name, subject)
-        
-        if validation_result.level == ValidationLevel.MANUAL_CHECK:
-            # Manuelle Prüfung erforderlich
+            self.log_message(f"   ❌ {result.error}")
+        elif result.planned_action == PlannedAction.MANUAL_REVIEW:
             self.stats['manual'] += 1
-            
-            # Переместить файл в папку manual_check
-            moved_path = None
-            if not dry_run:
-                moved_path = self.renamer.move_to_folder(pdf_path, manual_check_folder)
-                if moved_path:
-                    self.log_message(f"   📁 Verschoben nach: {manual_check_folder.name}/{moved_path.name}")
-                else:
-                    self.log_message(f"   ❌ Fehler beim Verschieben")
-                    self.stats['error'] += 1
-                    return
-            else:
-                self.log_message(f"   📁 [Simulation] Würde verschoben nach: {manual_check_folder.name}/")
-            
-            # Создать ReviewItem для очереди
-            # Используем фактическое имя после перемещения (учитывает коллизии)
-            if moved_path:
-                # Путь относительно selected_folder: manual_check/actual_filename.pdf
-                relative_path = str(Path("manual_check") / moved_path.name)
-            else:
-                # Dry run: используем исходное имя
-                relative_path = str(Path("manual_check") / pdf_path.name)
-            
-            review_item = ReviewItem(
-                file_path=relative_path,
-                raw_name=student_name,
-                raw_subject=subject,
-                reason=validation_result.message,
-                suggestions=validation_result.suggestions,
-                preview_text=text[:500]  # Первые 500 символов как контекст
-            )
-            
-            # Добавить в очередь
-            self.review_store.add(review_item)
-            
-            self.log_message(f"   ⚠️ Manuelle Prüfung: {validation_result.message}")
-            return
-        
-        # Datei umbenennen
-        if student_name and subject:
-            surname, name = student_name.split()
-            
-            # Получаем месяц и текущий год
-            month = self.selected_month.get()
-            year = datetime.now().year
-            
-            new_filename = self.renamer.generate_new_filename(surname, name, subject, month, year)
-            new_path = pdf_path.parent / new_filename
-            
-            self.log_message(f"   👤 Name: {student_name}")
-            self.log_message(f"   📚 Fach: {subject}")
-            
-            if validation_result.level == ValidationLevel.WARNING:
-                self.stats['warning'] += 1
-                self.log_message(f"   ⚠️ Warnung: {validation_result.message}")
-            
-            # Umbenennen
-            success = self.renamer.rename_file(pdf_path, new_path, dry_run)
-            
-            if success:
-                if validation_result.level == ValidationLevel.VALID:
-                    self.stats['success'] += 1
-                
-                if dry_run:
-                    self.log_message(f"   ✅ [Simulation] {pdf_path.name} → {new_filename}")
-                else:
-                    self.log_message(f"   ✅ Umbenannt: {pdf_path.name} → {new_filename}")
-            else:
-                self.stats['error'] += 1
-                self.log_message(f"   ❌ Fehler beim Umbenennen")
+            prefix = "[Simulation] " if dry_run else ""
+            self.log_message(f"   📁 {prefix}Ziel: {result.planned_path}")
+            self.log_message(f"   ⚠️ Manuelle Prüfung: {result.review_item.reason}")
         else:
-            self.stats['error'] += 1
-            self.log_message(f"   ❌ Name oder Fach konnte nicht ermittelt werden")
-        
-        self.log_message("")  # Leerzeile für bessere Lesbarkeit
+            data = result.found_data
+            student = getattr(result.student_match, "student", None)
+            self.log_message(
+                f"   👤 Name: {getattr(student, 'full_name', data.student_name)}"
+            )
+            self.log_message(f"   📚 Fach: {result.canonical_subject}")
+            if result.warnings:
+                self.stats['warning'] += 1
+                for warning in result.warnings:
+                    self.log_message(f"   ⚠️ Warnung: {warning}")
+            else:
+                self.stats['success'] += 1
+            prefix = "[Simulation] " if dry_run else ""
+            self.log_message(f"   ✅ {prefix}{pdf_path.name} → {result.planned_name}")
+        self.log_message("")
     
     def show_final_report(self):
         """Zeigt den Abschlussbericht"""

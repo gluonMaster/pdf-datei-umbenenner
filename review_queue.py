@@ -3,7 +3,9 @@
 """
 
 import json
-from dataclasses import dataclass, asdict
+import os
+import tempfile
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,6 +29,18 @@ class ReviewItem:
     reason: str
     suggestions: List[str]
     preview_text: str
+    # Pipeline metadata.  Defaults keep every pre-pipeline JSON entry valid.
+    form_type: Optional[str] = None
+    parser_confidence: Optional[float] = None
+    parser_reasons: List[str] = field(default_factory=list)
+    student_match_status: Optional[str] = None
+    student_suggestions: List[str] = field(default_factory=list)
+    canonical_student_number: Optional[int] = None
+    canonical_name: Optional[str] = None
+    canonical_subject: Optional[str] = None
+    selected_month: Optional[int] = None
+    selected_year: Optional[int] = None
+    planned_filename: Optional[str] = None
     
     def to_dict(self) -> dict:
         """Преобразует ReviewItem в словарь"""
@@ -34,8 +48,21 @@ class ReviewItem:
     
     @classmethod
     def from_dict(cls, data: dict) -> 'ReviewItem':
-        """Создает ReviewItem из словаря"""
-        return cls(**data)
+        """Создает ReviewItem из старого или текущего словаря.
+
+        Unknown keys are ignored so a newer queue can also be opened by a
+        slightly older application build.  Missing pipeline fields use the
+        dataclass defaults above.
+        """
+        if not isinstance(data, dict):
+            raise TypeError("Review item must be a JSON object")
+        known_fields = {item.name for item in fields(cls)}
+        payload = {key: value for key, value in data.items() if key in known_fields}
+        payload.setdefault("suggestions", [])
+        payload.setdefault("preview_text", "")
+        payload.setdefault("parser_reasons", [])
+        payload.setdefault("student_suggestions", [])
+        return cls(**payload)
 
 
 class ReviewStore:
@@ -105,9 +132,23 @@ class ReviewStore:
                 'review_items': [item.to_dict() for item in self.items]
             }
             
-            with open(self.store_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+            encoded = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.store_path.parent,
+                prefix=f".{self.store_path.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self.store_path)
+            except Exception:
+                temporary_path.unlink(missing_ok=True)
+                raise
             return True
             
         except (IOError, OSError) as e:

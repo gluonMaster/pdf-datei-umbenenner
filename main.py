@@ -1,266 +1,247 @@
-"""
-Главный скрипт для автоматического переименования PDF файлов
-"""
+"""Command-line adapter for the document processing service."""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple
 import sys
-from datetime import datetime
+from typing import List, Optional, Tuple
 
-from pdf_extractor import PDFExtractor
-from text_parser import TextParser
-from validator import Validator, ValidationLevel
 from file_renamer import FileRenamer
-from review_queue import ReviewStore, ReviewItem
+from form_parser import FormParser
+from pdf_extractor import PDFExtractor
+from processing_service import (
+    BatchProcessingResult,
+    DocumentProcessingService,
+    PlannedAction,
+    ProcessingResult,
+)
+from review_queue import ReviewStore
+from student_registry import StudentRegistry
+from validator import Validator
 
 
 class PDFRenamerApp:
-    """Главный класс приложения"""
-    
-    def __init__(self, input_folder: Path, dry_run: bool = False, month: int = None):
-        self.input_folder = input_folder
+    """Thin CLI facade retained for callers of the original application API."""
+
+    def __init__(
+        self,
+        input_folder: Path,
+        dry_run: bool = False,
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+        *,
+        service: Optional[DocumentProcessingService] = None,
+    ) -> None:
+        if month is None or year is None:
+            raise ValueError("Monat und Jahr müssen explizit angegeben werden.")
+        self.input_folder = Path(input_folder)
         self.dry_run = dry_run
-        self.month = month  # Номер месяца (1-12) или None
-        self.year = datetime.now().year  # Текущий год
-        self.manual_check_folder = input_folder / "manual_check"
-        
-        self.extractor = PDFExtractor()
-        self.parser = TextParser()
-        self.validator = Validator()
-        self.renamer = FileRenamer()
-        
-        # Хранилище для очереди ручной проверки
-        self.review_store = ReviewStore(input_folder / "manual_review.json")
-        
-        # Статистика
-        self.stats = {
-            'total': 0,
-            'success': 0,
-            'warning': 0,
-            'manual': 0,
-            'error': 0
-        }
-    
-    def find_pdf_files(self) -> List[Path]:
-        """
-        Находит все PDF файлы в папке
-        
-        Returns:
-            Список путей к PDF файлам
-        """
-        pdf_files = []
-        
-        for file_path in self.input_folder.iterdir():
-            if file_path.is_file() and self.extractor.is_valid_pdf(file_path):
-                pdf_files.append(file_path)
-        
-        return sorted(pdf_files)
-    
-    def process_file(self, pdf_path: Path) -> Tuple[bool, str]:
-        """
-        Обрабатывает один PDF файл
-        
-        Args:
-            pdf_path: Путь к PDF файлу
-            
-        Returns:
-            (успех, сообщение)
-        """
-        print(f"\nVerarbeite: {pdf_path.name}")
-        
-        # Извлекаем текст
-        text = self.extractor.extract_first_lines(pdf_path)
-        if not text:
-            return False, "Text konnte nicht extrahiert werden"
-        
-        # Парсим имя и дисциплину
-        student_name, subject = self.parser.parse_document(text)
-        
-        # Валидация
-        validation_result = self.validator.validate_document_data(
-            student_name, subject
-        )
-        
-        # Обработка в зависимости от уровня валидации
-        if validation_result.level == ValidationLevel.MANUAL_CHECK:
-            # Требует ручной проверки
-            self.stats['manual'] += 1
-            
-            # Перемещаем в папку для ручной проверки
-            moved_path = None
-            if not self.dry_run:
-                moved_path = self.renamer.move_to_folder(pdf_path, self.manual_check_folder)
-                if not moved_path:
-                    print(f"  -> Fehler beim Verschieben der Datei")
-                    return
-            
-            # Создаем ReviewItem для очереди ручной проверки
-            # Используем фактическое имя после перемещения (учитывает коллизии)
-            if moved_path:
-                # Путь относительно input_folder: manual_check/actual_filename.pdf
-                relative_path = str(Path("manual_check") / moved_path.name)
-            else:
-                # Dry run: используем исходное имя
-                relative_path = str(Path("manual_check") / pdf_path.name)
-            
-            review_item = ReviewItem(
-                file_path=relative_path,
-                raw_name=student_name,
-                raw_subject=subject,
-                reason=validation_result.message,
-                suggestions=validation_result.suggestions,
-                preview_text=text[:500]  # Первые 500 символов как контекст
+        self.month = month
+        self.year = year
+        self.manual_check_folder = self.input_folder / "manual_check"
+
+        if service is None:
+            project_folder = Path(__file__).parent
+            review_store = ReviewStore(self.input_folder / "manual_review.json")
+            review_store.load()
+            service = DocumentProcessingService(
+                extractor=PDFExtractor(),
+                parser=FormParser(),
+                student_registry=StudentRegistry(project_folder / "Schuler.csv"),
+                validator=Validator(),
+                review_store=review_store,
+                renamer=FileRenamer(),
+                manual_review_folder=self.manual_check_folder,
             )
-            
-            # Добавляем в очередь
-            self.review_store.add(review_item)
-            
-            message = f"  -> Manuelle Pruefung erforderlich: {validation_result.message}"
-            print(message)
-            if not self.dry_run:
-                print(f"  -> Verschoben nach: {self.manual_check_folder.name}/{moved_path.name}")
-            return False, message
-        
-        # Генерируем новое имя
-        surname, name = student_name.split()
-        new_filename = self.renamer.generate_new_filename(
-            surname, name, subject, self.month, self.year
+        self.service = service
+        # Compatibility attributes for integrations that inspect the facade.
+        self.extractor = service.extractor
+        self.parser = service.parser
+        self.validator = service.validator
+        self.renamer = service.renamer
+        self.review_store = service.review_store
+        self.stats = self._empty_stats()
+
+    @staticmethod
+    def _empty_stats() -> dict[str, int]:
+        return {"total": 0, "success": 0, "warning": 0, "manual": 0, "error": 0}
+
+    def find_pdf_files(self) -> List[Path]:
+        """Find every PDF candidate, including files that may fail to open."""
+
+        return sorted(
+            (
+                path
+                for path in self.input_folder.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".pdf"
+            ),
+            key=lambda path: path.name.casefold(),
         )
-        new_path = pdf_path.parent / new_filename
-        
-        # Информация о переименовании
-        print(f"  Name: {student_name}")
-        print(f"  Fach: {subject}")
-        
-        if validation_result.level == ValidationLevel.WARNING:
-            self.stats['warning'] += 1
-            print(f"  Warnung: {validation_result.message}")
-        
-        # Переименовываем файл
-        success = self.renamer.rename_file(pdf_path, new_path, self.dry_run)
-        
-        if success:
-            if validation_result.level == ValidationLevel.VALID:
-                self.stats['success'] += 1
-            print(f"  -> Neue Datei: {new_filename}")
-            return True, "Erfolgreich umbenannt"
-        else:
-            self.stats['error'] += 1
-            return False, "Fehler beim Umbenennen"
-    
-    def run(self):
-        """Запускает процесс переименования"""
+
+    def process_file(self, pdf_path: Path) -> Tuple[bool, str]:
+        """Compatibility wrapper around the one-document service method."""
+
+        result = self.service.process_document(
+            pdf_path,
+            self.month,
+            self.year,
+            self.dry_run,
+        )
+        self._record_result(result)
+        self._print_result(result)
+        if result.error:
+            return False, result.error
+        if result.requires_review:
+            return False, result.review_item.reason if result.review_item else "Manuelle Prüfung"
+        return True, "Umbenennung geplant" if self.dry_run else "Erfolgreich umbenannt"
+
+    def run(self) -> BatchProcessingResult:
+        """Run an isolated batch and return its complete action plan."""
+
         print("=" * 60)
         print("PDF Datei Umbenenner")
         print("=" * 60)
         print(f"Eingabeordner: {self.input_folder}")
-        
+        print(f"Zeitraum: {self.month:02d}/{self.year}")
         if self.dry_run:
-            print("MODUS: Simulation (keine Aenderungen)")
-        
-        print()
-        
-        # Находим все PDF файлы
+            print("MODUS: Simulation (keine Änderungen)")
+
         pdf_files = self.find_pdf_files()
-        self.stats['total'] = len(pdf_files)
-        
         if not pdf_files:
             print("Keine PDF-Dateien gefunden!")
-            return
-        
+            return BatchProcessingResult(())
         print(f"Gefunden: {len(pdf_files)} PDF-Datei(en)")
-        print()
-        
-        # Обрабатываем каждый файл
-        for pdf_path in pdf_files:
-            try:
-                self.process_file(pdf_path)
-            except Exception as e:
-                print(f"  Fehler: {str(e)}")
-                self.stats['error'] += 1
-        
-        # Сохраняем очередь ручной проверки
-        if self.review_store.count() > 0 and not self.dry_run:
-            if self.review_store.save():
-                print(f"\nWarteschlange fuer manuelle Pruefung gespeichert: {self.review_store.store_path.name}")
-                print(f"Anzahl der Eintraege: {self.review_store.count()}")
-        
-        # Выводим статистику
+
+        batch = self.service.process_batch(
+            pdf_files,
+            self.month,
+            self.year,
+            self.dry_run,
+        )
+        self.stats = self._empty_stats()
+        for result in batch.results:
+            self._record_result(result)
+            self._print_result(result)
+
+        if batch.review_queue_saved:
+            print(
+                "\nWarteschlange für manuelle Prüfung gespeichert: "
+                f"{self.review_store.store_path.name}"
+            )
+        if batch.review_queue_error:
+            print(f"\nFehler beim Speichern der Warteschlange: {batch.review_queue_error}")
         self.print_statistics()
-    
-    def print_statistics(self):
-        """Выводит итоговую статистику"""
+        return batch
+
+    def _record_result(self, result: ProcessingResult) -> None:
+        self.stats["total"] += 1
+        if result.error:
+            self.stats["error"] += 1
+        elif result.planned_action == PlannedAction.MANUAL_REVIEW:
+            self.stats["manual"] += 1
+        elif result.warnings:
+            self.stats["warning"] += 1
+        else:
+            self.stats["success"] += 1
+
+    @staticmethod
+    def _print_result(result: ProcessingResult) -> None:
+        print(f"\nVerarbeite: {result.pdf_path.name}")
+        if result.error:
+            print(f"  -> Fehler: {result.error}")
+            return
+        if result.found_data:
+            print(f"  Erkannter Name: {result.found_data.raw_student_name or '—'}")
+            print(f"  Erkanntes Fach: {result.found_data.raw_subject or '—'}")
+        if result.requires_review:
+            prefix = "[Simulation] " if result.dry_run else ""
+            print(f"  -> {prefix}Manuelle Prüfung: {result.review_item.reason}")
+            print(f"  -> Ziel: {result.planned_path}")
+            return
+        prefix = "[Simulation] " if result.dry_run else ""
+        print(f"  -> {prefix}Neue Datei: {result.planned_name}")
+        for warning in result.warnings:
+            print(f"  Warnung: {warning}")
+
+    def print_statistics(self) -> None:
         print("\n" + "=" * 60)
         print("STATISTIK")
         print("=" * 60)
-        print(f"Insgesamt verarbeitet:        {self.stats['total']}")
-        print(f"Erfolgreich umbenannt:        {self.stats['success']}")
-        print(f"Mit Warnungen umbenannt:      {self.stats['warning']}")
-        print(f"Manuelle Pruefung erforderlich: {self.stats['manual']}")
-        print(f"Fehler:                       {self.stats['error']}")
+        print(f"Insgesamt verarbeitet:          {self.stats['total']}")
+        print(f"Erfolgreich umbenannt/geplant: {self.stats['success']}")
+        print(f"Mit Warnungen:                 {self.stats['warning']}")
+        print(f"Manuelle Prüfung erforderlich: {self.stats['manual']}")
+        print(f"Fehler:                        {self.stats['error']}")
         print("=" * 60)
-        
-        if self.stats['manual'] > 0:
-            print(f"\nDateien fuer manuelle Pruefung: {self.manual_check_folder}")
 
 
-def main():
-    """Точка входа в программу"""
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Automatisches Umbenennen von gescannten PDF-Formularen'
+        description="Automatisches Umbenennen von gescannten PDF-Formularen"
     )
-    
     parser.add_argument(
-        'folder',
+        "folder",
         type=str,
-        nargs='?',  # Делаем аргумент опциональным
-        help='Pfad zum Ordner mit PDF-Dateien (optional - wenn не указан, запускается GUI)'
+        nargs="?",
+        help="Pfad zum Ordner mit PDF-Dateien (ohne Ordner wird die GUI gestartet)",
     )
-    
     parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Simulation ohne tatsaechliche Aenderungen'
+        "--dry-run",
+        action="store_true",
+        help="Simulation ohne Änderungen an PDF-, CSV- oder JSON-Dateien",
     )
-    
+    parser.add_argument("--gui", action="store_true", help="GUI-Modus starten")
     parser.add_argument(
-        '--gui',
-        action='store_true',
-        help='GUI-Modus starten'
-    )
-    
-    parser.add_argument(
-        '--month',
+        "--month",
         type=int,
         choices=range(1, 13),
-        help='Monat (1-12) fuer Dateinamen'
+        help="Monat (1-12) für Dateinamen",
     )
-    
-    args = parser.parse_args()
-    
-    # Если указан --gui или папка не указана, запускаем GUI
+    parser.add_argument("--year", type=int, help="Jahr für Dateinamen")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    # The application contains German/Russian diagnostics; do not let a legacy
+    # Windows code page make even ``--help`` crash on an umlaut.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+    parser = build_argument_parser()
+    args = parser.parse_args(argv)
+
     if args.gui or not args.folder:
         try:
             from gui_main import PDFRenamerGUI
-            app = PDFRenamerGUI()
-            app.run()
+
+            PDFRenamerGUI().run()
         except ImportError:
             print("Fehler: GUI-Komponenten nicht verfügbar!")
-            print("Stellen Sie sicher, dass tkinter installiert ist.")
             sys.exit(1)
         return
-    
-    # Проверяем существование папки для командной строки
+
+    if args.month is None or args.year is None:
+        parser.error("für die CLI-Verarbeitung sind --month und --year erforderlich")
+    if args.year < 1:
+        parser.error("--year muss eine positive Ganzzahl sein")
+
     input_folder = Path(args.folder)
     if not input_folder.exists() or not input_folder.is_dir():
-        print(f"Fehler: Ordner '{args.folder}' existiert nicht!")
-        sys.exit(1)
-    
-    # Запускаем приложение командной строки
-    app = PDFRenamerApp(input_folder, dry_run=args.dry_run, month=args.month)
+        parser.error(f"Ordner '{args.folder}' existiert nicht")
+
+    app = PDFRenamerApp(
+        input_folder,
+        dry_run=args.dry_run,
+        month=args.month,
+        year=args.year,
+    )
     app.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

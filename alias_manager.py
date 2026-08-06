@@ -4,6 +4,8 @@
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -11,7 +13,12 @@ from typing import Dict, Optional
 class AliasManager:
     """Класс для управления алиасами дисциплин"""
     
-    def __init__(self, alias_file: Optional[Path] = None):
+    def __init__(
+        self,
+        alias_file: Optional[Path] = None,
+        *,
+        create_if_missing: bool = True,
+    ):
         """
         Инициализирует менеджер алиасов
         
@@ -23,6 +30,7 @@ class AliasManager:
             alias_file = Path(__file__).parent / "subjects_aliases.json"
         
         self.alias_file = alias_file
+        self.create_if_missing = create_if_missing
         self.aliases: Dict[str, str] = {}
         
         # Автоматически загрузить алиасы при создании
@@ -38,7 +46,9 @@ class AliasManager:
         self.aliases = {}
         
         if not self.alias_file.exists():
-            # Создаем пустой файл, если он не существует
+            if not self.create_if_missing:
+                return True
+            # Обратная совместимость для явного использования менеджера.
             try:
                 self.save()
                 return True
@@ -68,9 +78,23 @@ class AliasManager:
                 'aliases': self.aliases
             }
             
-            with open(self.alias_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
+            self.alias_file.parent.mkdir(parents=True, exist_ok=True)
+            encoded = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self.alias_file.parent,
+                prefix=f".{self.alias_file.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self.alias_file)
+            except Exception:
+                temporary_path.unlink(missing_ok=True)
+                raise
             return True
         except (IOError, OSError) as e:
             print(f"Fehler beim Speichern von {self.alias_file.name}: {e}")
