@@ -8,6 +8,7 @@ imported.  It never installs packages or changes system configuration.
 import argparse
 import hashlib
 import importlib
+import importlib.util
 import json
 from enum import IntEnum
 from pathlib import Path
@@ -42,8 +43,18 @@ class ExitCode(IntEnum):
     TESSERACT_UNAVAILABLE = 31
     OCR_LANGUAGE_DATA_UNAVAILABLE = 32
     OCR_CHECK_FAILED = 33
+    PYMUPDF_RUNTIME_UNAVAILABLE = 34
+    PYMUPDF_IMPORT_FAILED = 35
     REQUIREMENTS_CHANGED = 40
     BOOTSTRAP_ERROR = 50
+
+
+class PyMuPDFImportFailure(ImportError):
+    """Installed PyMuPDF cannot be imported by the current interpreter."""
+
+    def __init__(self, detail, runtime_related=False):
+        super().__init__(detail)
+        self.runtime_related = bool(runtime_related)
 
 
 def _version_text(version_info=None):
@@ -179,13 +190,48 @@ def check_core(project_root=PROJECT_ROOT):
 
 
 def _load_pymupdf():
-    errors = []
+    """Load PyMuPDF and distinguish an absent wheel from a broken runtime."""
+
+    available_modules = []
     for module_name in ("pymupdf", "fitz"):
         try:
-            return importlib.import_module(module_name)
-        except ImportError as error:
-            errors.append(str(error))
-    raise ImportError("; ".join(errors) or "PyMuPDF is not installed")
+            if importlib.util.find_spec(module_name) is not None:
+                available_modules.append(module_name)
+        except (ImportError, AttributeError, ValueError):
+            continue
+
+    if not available_modules:
+        raise ModuleNotFoundError("PyMuPDF ist nicht installiert")
+
+    errors = []
+    for module_name in available_modules:
+        try:
+            module = importlib.import_module(module_name)
+            if not all(hasattr(module, attribute) for attribute in ("open", "Matrix")):
+                errors.append(module_name + ": Modul ist nicht PyMuPDF-kompatibel")
+                continue
+            return module
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            errors.append(module_name + ": " + detail)
+
+    combined = "; ".join(errors)
+    runtime_markers = (
+        "dll load failed",
+        "msvcp140",
+        "vcruntime140",
+        "pyinit__extra",
+        "while importing _extra",
+        "winerror 126",
+        "winerror 127",
+        "specified module could not be found",
+        "modul wurde nicht gefunden",
+        "dynamic link library",
+    )
+    runtime_related = any(
+        marker in combined.casefold() for marker in runtime_markers
+    )
+    raise PyMuPDFImportFailure(combined, runtime_related=runtime_related)
 
 
 def check_ocr(project_root=PROJECT_ROOT):
@@ -199,7 +245,7 @@ def check_ocr(project_root=PROJECT_ROOT):
 
     try:
         _load_pymupdf()
-    except ImportError as error:
+    except ModuleNotFoundError as error:
         detail = str(error).strip() or error.__class__.__name__
         print(
             "OCR_PYTHON_DEPENDENCY_UNAVAILABLE: requirements-ocr.txt installieren ("
@@ -207,6 +253,19 @@ def check_ocr(project_root=PROJECT_ROOT):
             + ")."
         )
         return ExitCode.OCR_PYTHON_DEPENDENCY_UNAVAILABLE
+    except PyMuPDFImportFailure as error:
+        detail = str(error).strip() or error.__class__.__name__
+        if error.runtime_related:
+            print(
+                "PYMUPDF_RUNTIME_UNAVAILABLE: PyMuPDF ist installiert, aber die "
+                "Windows-Laufzeit fehlt oder ist beschaedigt (" + detail + ")."
+            )
+            return ExitCode.PYMUPDF_RUNTIME_UNAVAILABLE
+        print(
+            "PYMUPDF_IMPORT_FAILED: PyMuPDF ist installiert, kann aber nicht "
+            "importiert werden (" + detail + ")."
+        )
+        return ExitCode.PYMUPDF_IMPORT_FAILED
 
     try:
         from ocr import TesseractOCRProvider

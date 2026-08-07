@@ -100,6 +100,58 @@ def test_ocr_health_uses_structured_unavailability_reasons(monkeypatch, capsys):
         assert expected_category in capsys.readouterr().out
 
 
+def test_ocr_health_distinguishes_pymupdf_failure_classes(monkeypatch, capsys):
+    cases = (
+        (
+            ModuleNotFoundError("PyMuPDF ist nicht installiert"),
+            bootstrap.ExitCode.OCR_PYTHON_DEPENDENCY_UNAVAILABLE,
+            "OCR_PYTHON_DEPENDENCY_UNAVAILABLE",
+        ),
+        (
+            bootstrap.PyMuPDFImportFailure(
+                "DLL load failed while importing _extra", runtime_related=True
+            ),
+            bootstrap.ExitCode.PYMUPDF_RUNTIME_UNAVAILABLE,
+            "PYMUPDF_RUNTIME_UNAVAILABLE",
+        ),
+        (
+            bootstrap.PyMuPDFImportFailure(
+                "unerwarteter Importfehler", runtime_related=False
+            ),
+            bootstrap.ExitCode.PYMUPDF_IMPORT_FAILED,
+            "PYMUPDF_IMPORT_FAILED",
+        ),
+    )
+
+    for error, expected_code, expected_category in cases:
+        def fail_import(current=error):
+            raise current
+
+        monkeypatch.setattr(bootstrap, "_load_pymupdf", fail_import)
+        assert bootstrap.check_ocr() == expected_code
+        assert expected_category in capsys.readouterr().out
+
+
+def test_pymupdf_loader_classifies_windows_runtime_errors(monkeypatch):
+    monkeypatch.setattr(
+        bootstrap.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "pymupdf" else None,
+    )
+
+    def fail_import(name):
+        raise ImportError("DLL load failed while importing _extra: MSVCP140.dll")
+
+    monkeypatch.setattr(bootstrap.importlib, "import_module", fail_import)
+
+    try:
+        bootstrap._load_pymupdf()
+    except bootstrap.PyMuPDFImportFailure as error:
+        assert error.runtime_related is True
+    else:
+        raise AssertionError("A broken PyMuPDF import must fail the health check")
+
+
 def test_requirements_stamp_detects_changes(tmp_path):
     (tmp_path / "requirements.txt").write_text("example>=1\n", encoding="ascii")
 
@@ -137,6 +189,11 @@ def test_batch_files_are_ascii_and_use_the_local_environment():
     ).casefold()
 
     assert '"%venv_python%" -m pip install' in setup
+    assert "--unattended" in setup
+    assert "--core-only" in setup
+    assert "--force-reinstall --no-cache-dir" in setup
+    assert "install_vc_runtime.ps1" in setup
+    assert 'if "%ocr_required%"=="1"' in setup
     assert '"%venv_python%" -m pip install' in smart
     assert "requirements-current" in smart
     assert "--health-only" in smart
@@ -163,4 +220,17 @@ def test_dependency_groups_are_separate():
     assert "six>=" not in core
     assert "PyMuPDF" not in core
     assert "PyMuPDF" in ocr
+    assert "PyMuPDF>=1.27,<1.29" in ocr
     assert "pytest" in dev
+
+
+def test_vc_runtime_installer_verifies_publisher_before_execution():
+    script = (PROJECT_ROOT / "install_vc_runtime.ps1").read_text(encoding="utf-8")
+
+    assert "https://aka.ms/vc14/vc_redist.x64.exe" in script
+    assert "Get-AuthenticodeSignature" in script
+    assert "CN=Microsoft Corporation" in script
+    assert script.index("Get-AuthenticodeSignature") < script.index("Start-Process")
+    assert '"/quiet", "/norestart"' in script
+    assert "WindowsBuiltInRole" in script
+    assert "Invoke-Expression" not in script
