@@ -1,42 +1,26 @@
-"""
-Тестовый скрипт для проверки функциональности вкладки "Prüfung"
-"""
+"""Isolated persistence coverage for data shown by the review tab."""
 
-import sys
-from pathlib import Path
+from review_queue import ReviewItem, ReviewStore
 
-# Добавляем родительскую директорию в путь
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from review_queue import ReviewStore, ReviewItem
+def test_review_queue_uses_only_synthetic_temporary_data(tmp_path):
+    queue_path = tmp_path / "manual_review.json"
+    item = ReviewItem(
+        file_path="manual_check/anonymous.pdf",
+        raw_name="Sample Student",
+        raw_subject="Matematik",
+        reason="Unbekanntes Fach",
+        suggestions=["Mathematik"],
+        preview_text="Anonymous preview",
+    )
+    store = ReviewStore(queue_path)
+    store.add(item)
 
-def test_review_queue():
-    """Тест базовой функциональности ReviewStore"""
-    print("=" * 60)
-    print("Тест ReviewStore")
-    print("=" * 60)
-    
-    # Создать тестовый store
-    store = ReviewStore(Path(__file__).parent.parent / "manual_review.json")
-    
-    # Загрузить данные
-    store.load()
-    
-    items = store.get_all()
-    print(f"\nЗагружено элементов: {len(items)}")
-    
-    for idx, item in enumerate(items, 1):
-        print(f"\n--- Элемент {idx} ---")
-        print(f"Файл: {Path(item.file_path).name}")
-        print(f"Имя: {item.raw_name}")
-        print(f"Дисциплина: {item.raw_subject}")
-        print(f"Причина: {item.reason}")
-        print(f"Подсказки: {', '.join(item.suggestions) if item.suggestions else 'нет'}")
-        print(f"Превью: {item.preview_text[:50]}...")
-    
-    print("\n" + "=" * 60)
-    print("Тест завершен успешно!")
-    print("=" * 60)
+    assert store.save()
 
-if __name__ == "__main__":
-    test_review_queue()
+    loaded = ReviewStore(queue_path)
+    loaded.load()
+
+    assert loaded.count() == 1
+    assert loaded.get_all()[0].to_dict() == item.to_dict()
+    assert loaded.store_path.parent == tmp_path

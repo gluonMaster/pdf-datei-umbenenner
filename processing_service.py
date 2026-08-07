@@ -272,6 +272,7 @@ class DocumentProcessingService:
             performed_action = PerformedAction.NONE
             if not dry_run:
                 if not self.renamer.rename_file(pdf_path, planned_path):
+                    self._release_reservation(planned_path)
                     raise OSError(f"Datei konnte nicht in {planned_path.name} umbenannt werden.")
                 performed_action = PerformedAction.RENAMED
                 stages.append(ProcessingStage.ACTION)
@@ -370,9 +371,9 @@ class DocumentProcessingService:
     @staticmethod
     def _validate_period(month: int, year: int) -> None:
         if not isinstance(month, int) or isinstance(month, bool) or not 1 <= month <= 12:
-            raise ValueError("month must be an integer between 1 and 12")
+            raise ValueError("Monat muss eine Ganzzahl zwischen 1 und 12 sein.")
         if not isinstance(year, int) or isinstance(year, bool) or year < 1:
-            raise ValueError("year must be a positive integer")
+            raise ValueError("Jahr muss eine positive Ganzzahl sein.")
 
     def _extract(self, pdf_path: Path) -> Any:
         for method_name in ("extract_page_data", "extract_first_page", "extract"):
@@ -555,10 +556,43 @@ class DocumentProcessingService:
         performed_action = PerformedAction.NONE
         if not dry_run:
             if not self.renamer.move_file(pdf_path, planned_path):
+                self._release_reservation(planned_path)
                 raise OSError(
                     f"Datei konnte nicht nach {planned_path.parent.name} verschoben werden."
                 )
             self.review_store.add(review_item)
+            items_with_review = self.review_store.get_all()
+            previous_items = items_with_review[:-1]
+            try:
+                queue_saved = bool(self.review_store.save())
+            except Exception as error:
+                queue_saved = False
+                queue_error = str(error) or error.__class__.__name__
+            else:
+                queue_error = "unbekannter Speicherfehler"
+            if not queue_saved:
+                # Moving a PDF and updating JSON cannot be one filesystem
+                # transaction. Compensate immediately so a failed JSON write
+                # does not leave an unlisted document in manual_check.
+                self.review_store.items = previous_items
+                rolled_back = self.renamer.move_file(planned_path, pdf_path)
+                self._release_reservation(planned_path)
+                if rolled_back:
+                    raise OSError(
+                        "Warteschlange konnte nicht gespeichert werden; die PDF wurde "
+                        f"an ihren Ausgangsort zurückverschoben ({queue_error})."
+                    )
+
+                # Preserve the recovery information in memory and let the
+                # batch-level save retry once. The error names the actual file
+                # location so manual recovery remains possible even if storage
+                # stays unavailable.
+                self.review_store.items = items_with_review
+                raise OSError(
+                    "Warteschlange konnte nicht gespeichert und die PDF nicht "
+                    f"zurückverschoben werden. Datei liegt unter: {planned_path} "
+                    f"({queue_error})."
+                )
             performed_action = PerformedAction.MOVED_TO_REVIEW
             stages.append(ProcessingStage.ACTION)
 
@@ -589,6 +623,11 @@ class DocumentProcessingService:
             return str(planned_path.relative_to(base_folder))
         except ValueError:
             return str(planned_path)
+
+    def _release_reservation(self, path: Path) -> None:
+        release = getattr(self.renamer, "release_target_path", None)
+        if callable(release):
+            release(path)
 
 
 # Alternative names make the public boundary obvious to existing callers.

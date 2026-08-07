@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -89,8 +89,16 @@ class ReviewActionService:
             last_name = self._required(request.last_name, "Nachname")
             first_name = self._required(request.first_name, "Vorname")
             subject = self._required(request.subject, "Fach")
-            month = request.item.selected_month or request.fallback_month
-            year = request.item.selected_year or request.fallback_year
+            month = (
+                request.item.selected_month
+                if request.item.selected_month is not None
+                else request.fallback_month
+            )
+            year = (
+                request.item.selected_year
+                if request.item.selected_year is not None
+                else request.fallback_year
+            )
             self._validate_period(month, year)
 
             source_path = self._source_path(request.base_folder, request.item.file_path)
@@ -128,9 +136,23 @@ class ReviewActionService:
 
             raw_subject = (request.item.raw_subject or "").strip()
             if raw_subject and raw_subject != subject:
-                if not self.subject_aliases.add_alias(raw_subject, subject):
-                    raise OSError("Fachalias konnte nicht vorbereitet werden.")
-                if not self.subject_aliases.save():
+                add_and_save = getattr(self.subject_aliases, "add_and_save", None)
+                if callable(add_and_save):
+                    alias_saved = bool(add_and_save(raw_subject, subject))
+                else:
+                    previous_aliases = self.subject_aliases.get_all_aliases()
+                    try:
+                        alias_saved = bool(
+                            self.subject_aliases.add_alias(raw_subject, subject)
+                            and self.subject_aliases.save()
+                        )
+                    except Exception:
+                        if hasattr(self.subject_aliases, "aliases"):
+                            self.subject_aliases.aliases = previous_aliases
+                        raise
+                    if not alias_saved and hasattr(self.subject_aliases, "aliases"):
+                        self.subject_aliases.aliases = previous_aliases
+                if not alias_saved:
                     raise OSError("Fachalias konnte nicht gespeichert werden.")
                 subject_alias_saved = True
 
@@ -144,14 +166,45 @@ class ReviewActionService:
                 source_path=source_path,
             )
             if not self.renamer.move_file(source_path, target_path):
+                self._release_reservation(target_path)
                 raise OSError(f"PDF konnte nicht nach {target_path.name} verschoben werden.")
             file_moved = True
 
             if not self._remove_from_queue_safely(request.item.file_path):
+                rolled_back = self.renamer.move_file(target_path, source_path)
+                self._release_reservation(target_path)
+                if rolled_back:
+                    file_moved = False
+                    persistent_change = (
+                        registry_saved or student_alias_saved or subject_alias_saved
+                    )
+                    return ReviewActionResult(
+                        ReviewActionStatus.PARTIAL if persistent_change else ReviewActionStatus.ERROR,
+                        "Warteschlange konnte nicht gespeichert werden; die PDF wurde "
+                        "an ihren Prüfpfad zurückverschoben. Der Eintrag bleibt erhalten.",
+                        target_path,
+                        student,
+                        registry_saved,
+                        student_alias_saved,
+                        subject_alias_saved,
+                        file_moved=False,
+                        queue_removed=False,
+                    )
+
+                recovery_saved = self._retarget_queue_item(
+                    request.item,
+                    target_path,
+                    Path(request.base_folder),
+                )
                 return ReviewActionResult(
                     ReviewActionStatus.PARTIAL,
-                    "PDF wurde umbenannt, aber der Warteschlangeneintrag konnte "
-                    "nicht gespeichert entfernt werden. Bitte Warteschlange neu laden.",
+                    "PDF wurde umbenannt, konnte aber nach einem Warteschlangenfehler "
+                    "nicht zurückverschoben werden. "
+                    + (
+                        "Der Eintrag wurde auf den neuen Pfad aktualisiert."
+                        if recovery_saved
+                        else f"Bitte Datei und Warteschlange manuell prüfen: {target_path}"
+                    ),
                     target_path,
                     student,
                     registry_saved,
@@ -229,6 +282,45 @@ class ReviewActionService:
         # on-disk queue when its atomic save failed.
         self.review_store.items = previous_items
         return False
+
+    def _retarget_queue_item(
+        self,
+        original_item: ReviewItem,
+        target_path: Path,
+        base_folder: Path,
+    ) -> bool:
+        try:
+            stored_path = str(target_path.relative_to(base_folder))
+        except ValueError:
+            stored_path = str(target_path)
+        recovery_item = replace(
+            original_item,
+            file_path=stored_path,
+            planned_filename=target_path.name,
+        )
+        updated_items = []
+        replaced_existing = False
+        for item in self.review_store.get_all():
+            if item.file_path == original_item.file_path:
+                updated_items.append(recovery_item)
+                replaced_existing = True
+            else:
+                updated_items.append(item)
+        if not replaced_existing:
+            # The UI may hold a stale item while the in-memory queue no longer
+            # contains it.  Never report a successful recovery after merely
+            # saving an empty queue: add an explicit entry for the actual PDF.
+            updated_items.append(recovery_item)
+        self.review_store.items = updated_items
+        try:
+            return bool(self.review_store.save())
+        except Exception:
+            return False
+
+    def _release_reservation(self, path: Path) -> None:
+        release = getattr(self.renamer, "release_target_path", None)
+        if callable(release):
+            release(path)
 
     @staticmethod
     def _source_path(base_folder: Path, item_path: str) -> Path:

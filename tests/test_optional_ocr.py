@@ -153,7 +153,7 @@ def test_unavailable_ocr_is_diagnostic_manual_review(tmp_path):
     source = tmp_path / "unavailable.pdf"
     _image_only_pdf(source)
     provider = FakeOCRProvider(
-        OCRResult.unavailable("OCR unavailable: fake Tesseract is missing.")
+        OCRResult.unavailable("OCR ist nicht verfügbar: Test-Tesseract fehlt.")
     )
     extractor = OCRFallbackExtractor(PDFExtractor(), provider)
 
@@ -164,7 +164,7 @@ def test_unavailable_ocr_is_diagnostic_manual_review(tmp_path):
     assert result.error is None
     assert result.planned_action == PlannedAction.MANUAL_REVIEW
     assert result.ocr_status == OCRStatus.UNAVAILABLE.value
-    assert "OCR unavailable" in result.review_item.reason
+    assert "OCR ist nicht verfügbar" in result.review_item.reason
     assert result.review_item.ocr_status == OCRStatus.UNAVAILABLE.value
     assert result.planned_path.exists()
 
@@ -241,7 +241,8 @@ def test_tesseract_reports_missing_language_data(monkeypatch, tmp_path):
     availability = provider.check_availability()
 
     assert not availability.available
-    assert "missing Tesseract language data: deu" in availability.message
+    assert availability.missing_languages == ("deu",)
+    assert "Tesseract-Sprachdaten fehlen: deu" in availability.message
 
 
 def test_real_tesseract_image_only_pdf_when_available(tmp_path):

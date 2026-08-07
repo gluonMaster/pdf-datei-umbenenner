@@ -135,17 +135,17 @@ def normalize_name(value: str) -> str:
     """
 
     if not isinstance(value, str):
-        raise TypeError("A student name must be text.")
+        raise TypeError("Der Schülername muss Text sein.")
     normalized = unicodedata.normalize("NFC", value)
     return " ".join(normalized.split()).casefold()
 
 
 def _clean_display(value: str, field_name: str) -> str:
     if not isinstance(value, str):
-        raise RegistryValidationError(f"{field_name} must be text.")
+        raise RegistryValidationError(f"{field_name} muss Text sein.")
     cleaned = " ".join(unicodedata.normalize("NFC", value).split())
     if not cleaned:
-        raise RegistryValidationError(f"{field_name} must not be empty.")
+        raise RegistryValidationError(f"{field_name} darf nicht leer sein.")
     return cleaned
 
 
@@ -158,7 +158,8 @@ def _parse_active(value: object, row_number: int) -> bool:
     if key in {"0", "false", "no", "nein", "inactive", "inaktiv"}:
         return False
     raise RegistryValidationError(
-        f"Row {row_number}: Aktiv must be a boolean value, got {value!r}."
+        f"Zeile {row_number}: Aktiv muss Ja/Nein beziehungsweise 1/0 sein; "
+        f"erhalten: {value!r}."
     )
 
 
@@ -188,13 +189,17 @@ class StudentRegistry:
             else self.csv_path.with_name("student_aliases.json")
         )
         if suggestion_limit < 1:
-            raise ValueError("suggestion_limit must be at least 1.")
+            raise ValueError("Die Anzahl der Vorschläge muss mindestens 1 sein.")
         if not 0.0 <= fuzzy_threshold <= 1.0:
-            raise ValueError("fuzzy_threshold must be between 0 and 1.")
+            raise ValueError(
+                "Der Schwellenwert für unscharfe Treffer muss zwischen 0 und 1 liegen."
+            )
         if not 0.0 <= ambiguity_threshold <= 1.0:
-            raise ValueError("ambiguity_threshold must be between 0 and 1.")
+            raise ValueError(
+                "Der Schwellenwert für Mehrdeutigkeiten muss zwischen 0 und 1 liegen."
+            )
         if ambiguity_delta < 0.0:
-            raise ValueError("ambiguity_delta must not be negative.")
+            raise ValueError("Die Toleranz für Mehrdeutigkeiten darf nicht negativ sein.")
 
         self.suggestion_limit = suggestion_limit
         self.fuzzy_threshold = fuzzy_threshold
@@ -250,8 +255,8 @@ class StudentRegistry:
             self._aliases = {}
             self._schema = None
             self._load_error = (
-                f"Student registry is unavailable: {exc}. "
-                "Send affected documents to manual review."
+                f"Das Schülerverzeichnis ist nicht verfügbar: {exc}. "
+                "Betroffene Dokumente müssen manuell geprüft werden."
             )
             return False
 
@@ -270,7 +275,7 @@ class StudentRegistry:
                 MatchStatus.ERROR,
                 None,
                 (),
-                self._load_error or "Student registry is unavailable.",
+                self._load_error or "Das Schülerverzeichnis ist nicht verfügbar.",
             )
 
         try:
@@ -282,7 +287,7 @@ class StudentRegistry:
                 MatchStatus.UNKNOWN,
                 None,
                 (),
-                "The parsed student name is empty; manual confirmation is required.",
+                "Der erkannte Schülername ist leer; eine manuelle Bestätigung ist erforderlich.",
             )
 
         exact = self._exact_candidates(key)
@@ -292,7 +297,8 @@ class StudentRegistry:
                 MatchStatus.EXACT,
                 student,
                 (),
-                f"Exact canonical or confirmed-alias match for student {student.number}.",
+                f"Exakter Treffer im Schülerverzeichnis oder über einen bestätigten Alias "
+                f"für Schüler Nr. {student.number}.",
             )
         if len(exact) > 1:
             ranked = tuple(StudentSuggestion(item, 1.0) for item in exact)
@@ -300,14 +306,18 @@ class StudentRegistry:
                 MatchStatus.AMBIGUOUS,
                 None,
                 exact,
-                "More than one canonical student has this normalized name.",
+                "Mehrere Schüler haben denselben normalisierten Namen; "
+                "bitte manuell auswählen.",
                 ranked,
             )
 
         ranked = self._fuzzy_suggestions(key)
         suggestions = tuple(item.student for item in ranked)
         status = MatchStatus.UNKNOWN
-        reason = "No exact student or confirmed alias matched; manual confirmation is required."
+        reason = (
+            "Kein exakter Schüler oder bestätigter Alias gefunden; "
+            "eine manuelle Bestätigung ist erforderlich."
+        )
         if (
             len(ranked) >= 2
             and ranked[0].score >= self.ambiguity_threshold
@@ -315,15 +325,15 @@ class StudentRegistry:
             and ranked[0].score - ranked[1].score <= self.ambiguity_delta
         ):
             status = MatchStatus.AMBIGUOUS
-            reason = "Several similarly ranked students require manual selection."
+            reason = "Mehrere ähnlich passende Schüler erfordern eine manuelle Auswahl."
         return StudentMatch(status, None, suggestions, reason, ranked)
 
     def match_parts(self, last_name: str, first_name: str) -> StudentMatch:
         """Match explicit name fields in the registry's canonical order."""
 
         try:
-            raw_name = f"{_clean_display(last_name, 'last_name')} " \
-                       f"{_clean_display(first_name, 'first_name')}"
+            raw_name = f"{_clean_display(last_name, 'Nachname')} " \
+                       f"{_clean_display(first_name, 'Vorname')}"
         except RegistryValidationError as exc:
             return StudentMatch(MatchStatus.UNKNOWN, None, (), str(exc))
         return self.match(raw_name)
@@ -340,7 +350,7 @@ class StudentRegistry:
             return self._students_by_number[int(student_number)]
         except (KeyError, TypeError, ValueError) as exc:
             raise RegistryValidationError(
-                f"Unknown student number: {student_number!r}."
+                f"Unbekannte Schülernummer: {student_number!r}."
             ) from exc
 
     def confirm_existing(
@@ -356,13 +366,13 @@ class StudentRegistry:
         if not save_alias:
             return student
 
-        alias_name = _clean_display(raw_name, "raw_name")
+        alias_name = _clean_display(raw_name, "Erkannter Name")
         alias_key = normalize_name(alias_name)
         existing = self._aliases.get(alias_key)
         if existing:
             if existing.student_number != student.number:
                 raise RegistryValidationError(
-                    "This alias is already assigned to another student."
+                    "Dieser Alias ist bereits einem anderen Schüler zugeordnet."
                 )
             return student
 
@@ -370,7 +380,7 @@ class StudentRegistry:
         conflicting = [item for item in canonical_candidates if item.number != student.number]
         if conflicting:
             raise RegistryValidationError(
-                "The alias is an exact canonical name of another student."
+                "Der Alias entspricht exakt dem Namen eines anderen Schülers."
             )
         if canonical_candidates:
             return student  # A redundant alias for the same row need not be written.
@@ -387,7 +397,7 @@ class StudentRegistry:
         """Remove one erroneous alias without changing its canonical student."""
 
         self._require_available()
-        clean_name = _clean_display(alias_name, "alias_name")
+        clean_name = _clean_display(alias_name, "Alias")
         alias_key = normalize_name(clean_name)
         if alias_key not in self._aliases:
             return False
@@ -408,10 +418,10 @@ class StudentRegistry:
         """Explicitly add a canonical student using the next stable number."""
 
         self._require_available()
-        clean_last = _clean_display(last_name, "last_name")
-        clean_first = _clean_display(first_name, "first_name")
+        clean_last = _clean_display(last_name, "Nachname")
+        clean_first = _clean_display(first_name, "Vorname")
         if not isinstance(active, bool):
-            raise RegistryValidationError("active must be true or false.")
+            raise RegistryValidationError("Der Aktiv-Status muss wahr oder falsch sein.")
         self._ensure_unique_canonical(clean_last, clean_first)
 
         number = max(self._students_by_number, default=0) + 1
@@ -446,16 +456,16 @@ class StudentRegistry:
 
         current = self.select_existing(student_number)
         clean_last = (
-            current.last_name if last_name is None else _clean_display(last_name, "last_name")
+            current.last_name if last_name is None else _clean_display(last_name, "Nachname")
         )
         clean_first = (
             current.first_name
             if first_name is None
-            else _clean_display(first_name, "first_name")
+            else _clean_display(first_name, "Vorname")
         )
         new_active = current.active if active is None else active
         if not isinstance(new_active, bool):
-            raise RegistryValidationError("active must be true or false.")
+            raise RegistryValidationError("Der Aktiv-Status muss wahr oder falsch sein.")
         self._ensure_unique_canonical(clean_last, clean_first, except_number=current.number)
 
         replacement = Student(current.number, clean_last, clean_first, new_active)
@@ -496,11 +506,11 @@ class StudentRegistry:
         for student in additions:
             if student.number in existing_numbers:
                 raise RegistryValidationError(
-                    f"Student number {student.number} already exists."
+                    f"Die Schülernummer {student.number} ist bereits vorhanden."
                 )
             if student.number in addition_numbers:
                 raise RegistryValidationError(
-                    f"Duplicate student number {student.number}."
+                    f"Die Schülernummer {student.number} kommt in den neuen Einträgen mehrfach vor."
                 )
             addition_numbers.add(student.number)
             self._ensure_unique_canonical(student.last_name, student.first_name)
@@ -510,7 +520,7 @@ class StudentRegistry:
             )
             if name_key in addition_names:
                 raise RegistryValidationError(
-                    "A canonical student with this first and last name already exists."
+                    "Ein Schüler mit diesem Vor- und Nachnamen ist bereits vorhanden."
                 )
             addition_names.add(name_key)
 
@@ -554,26 +564,26 @@ class StudentRegistry:
     @staticmethod
     def _read_students(path: Path) -> Tuple[Tuple[Student, ...], _CsvSchema]:
         if not path.exists():
-            raise RegistryValidationError(f"CSV file does not exist: {path}")
+            raise RegistryValidationError(f"CSV-Datei ist nicht vorhanden: {path}")
         if not path.is_file():
-            raise RegistryValidationError(f"CSV path is not a file: {path}")
+            raise RegistryValidationError(f"CSV-Pfad verweist nicht auf eine Datei: {path}")
 
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle, delimiter=";", strict=True)
             if reader.fieldnames is None:
-                raise RegistryValidationError("CSV header is missing.")
+                raise RegistryValidationError("CSV-Kopfzeile fehlt.")
             stripped_headers = [header.strip() for header in reader.fieldnames]
             if len(stripped_headers) != len(set(stripped_headers)):
-                raise RegistryValidationError("CSV contains duplicate headers.")
+                raise RegistryValidationError("CSV enthält doppelte Spaltenüberschriften.")
             header_map = dict(zip(stripped_headers, reader.fieldnames))
             if "Nummer" not in header_map or "Nachname" not in header_map:
                 raise RegistryValidationError(
-                    "CSV must contain Nummer and Nachname columns."
+                    "CSV muss die Spalten Nummer und Nachname enthalten."
                 )
             first_headers = [name for name in ("Vorname", "Forname") if name in header_map]
             if not first_headers:
                 raise RegistryValidationError(
-                    "CSV must contain either Vorname or legacy Forname."
+                    "CSV muss entweder Vorname oder die veraltete Spalte Forname enthalten."
                 )
             first_header = "Vorname" if "Vorname" in first_headers else "Forname"
             schema = _CsvSchema(first_header, "Aktiv" in header_map)
@@ -583,7 +593,7 @@ class StudentRegistry:
             for row_number, row in enumerate(reader, start=2):
                 if None in row:
                     raise RegistryValidationError(
-                        f"Row {row_number} has more fields than the header."
+                        f"Zeile {row_number} enthält mehr Felder als die Kopfzeile."
                     )
                 values = ["" if value is None else str(value) for value in row.values()]
                 if not any(value.strip() for value in values):
@@ -593,25 +603,25 @@ class StudentRegistry:
                     number = int(str(raw_number).strip())
                 except (TypeError, ValueError) as exc:
                     raise RegistryValidationError(
-                        f"Row {row_number}: Nummer must be an integer."
+                        f"Zeile {row_number}: Nummer muss eine Ganzzahl sein."
                     ) from exc
                 if number <= 0:
                     raise RegistryValidationError(
-                        f"Row {row_number}: Nummer must be positive."
+                        f"Zeile {row_number}: Nummer muss positiv sein."
                     )
                 if number in numbers:
                     raise RegistryValidationError(
-                        f"Duplicate student number {number} in row {row_number}."
+                        f"Doppelte Schülernummer {number} in Zeile {row_number}."
                     )
                 numbers.add(number)
 
                 last_name = _clean_display(
                     row.get(header_map["Nachname"], ""),
-                    f"row {row_number} Nachname",
+                    f"Zeile {row_number} Nachname",
                 )
                 first_name = _clean_display(
                     row.get(header_map[first_header], ""),
-                    f"row {row_number} {first_header}",
+                    f"Zeile {row_number} {first_header}",
                 )
                 active_value = (
                     row.get(header_map["Aktiv"])
@@ -623,7 +633,7 @@ class StudentRegistry:
                 )
 
         if not students:
-            raise RegistryValidationError("CSV contains no student rows.")
+            raise RegistryValidationError("CSV enthält keine Schülerzeilen.")
         return tuple(students), schema
 
     @staticmethod
@@ -634,14 +644,18 @@ class StudentRegistry:
         if not path.exists():
             return {}
         if not path.is_file():
-            raise RegistryValidationError(f"Alias path is not a file: {path}")
+            raise RegistryValidationError(f"Alias-Pfad verweist nicht auf eine Datei: {path}")
         with path.open("r", encoding="utf-8-sig") as handle:
             payload = json.load(handle)
         if not isinstance(payload, dict):
-            raise RegistryValidationError("Alias JSON root must be an object.")
+            raise RegistryValidationError(
+                "Das Wurzelelement der Alias-JSON-Datei muss ein Objekt sein."
+            )
         version = payload.get("version", 1)
         if version != 1:
-            raise RegistryValidationError(f"Unsupported alias format version: {version!r}.")
+            raise RegistryValidationError(
+                f"Nicht unterstützte Version des Aliasformats: {version!r}."
+            )
         raw_aliases = payload.get("aliases", {})
         entries = []
         if isinstance(raw_aliases, dict):
@@ -653,28 +667,36 @@ class StudentRegistry:
         elif isinstance(raw_aliases, list):
             entries = raw_aliases
         else:
-            raise RegistryValidationError("aliases must be an object or a list.")
+            raise RegistryValidationError(
+                "Das Feld 'aliases' muss ein Objekt oder eine Liste sein."
+            )
 
         aliases: Dict[str, _Alias] = {}
         for position, entry in enumerate(entries, start=1):
             if not isinstance(entry, dict):
-                raise RegistryValidationError(f"Alias entry {position} must be an object.")
-            name = _clean_display(entry.get("name"), f"alias entry {position} name")
+                raise RegistryValidationError(
+                    f"Aliaseintrag {position} muss ein Objekt sein."
+                )
+            name = _clean_display(
+                entry.get("name"), f"Name in Aliaseintrag {position}"
+            )
             try:
                 student_number = int(entry.get("student_number"))
             except (TypeError, ValueError) as exc:
                 raise RegistryValidationError(
-                    f"Alias entry {position} has an invalid student_number."
+                    f"Aliaseintrag {position} enthält im Feld 'student_number' "
+                    "eine ungültige Schülernummer."
                 ) from exc
             if student_number not in students_by_number:
                 raise RegistryValidationError(
-                    f"Alias {name!r} refers to unknown student {student_number}."
+                    f"Alias {name!r} verweist auf die unbekannte Schülernummer "
+                    f"{student_number}."
                 )
             key = normalize_name(name)
             existing = aliases.get(key)
             if existing and existing.student_number != student_number:
                 raise RegistryValidationError(
-                    f"Alias {name!r} is assigned to more than one student."
+                    f"Alias {name!r} ist mehreren Schülern zugeordnet."
                 )
             aliases[key] = _Alias(name, student_number)
         return aliases
@@ -691,7 +713,7 @@ class StudentRegistry:
             conflicts = canonical.get(key, set()) - {alias.student_number}
             if conflicts:
                 raise RegistryValidationError(
-                    f"Alias {alias.name!r} conflicts with a canonical student name."
+                    f"Alias {alias.name!r} kollidiert mit einem offiziellen Schülernamen."
                 )
 
     @staticmethod
@@ -753,7 +775,7 @@ class StudentRegistry:
             )
             if existing == key:
                 raise RegistryValidationError(
-                    "A canonical student with this first and last name already exists."
+                    "Ein Schüler mit diesem Vor- und Nachnamen ist bereits vorhanden."
                 )
 
     def _ensure_active_schema(self, schema: _CsvSchema, *, required: bool) -> _CsvSchema:
@@ -795,20 +817,24 @@ class StudentRegistry:
     @staticmethod
     def _validate_students_for_write(students: Sequence[Student]) -> None:
         if not students:
-            raise RegistryValidationError("At least one student row is required.")
+            raise RegistryValidationError("Mindestens ein Schülereintrag ist erforderlich.")
         numbers = set()
         for student in students:
             if not isinstance(student.number, int) or student.number <= 0:
-                raise RegistryValidationError("Every student number must be a positive integer.")
+                raise RegistryValidationError(
+                    "Jede Schülernummer muss eine positive Ganzzahl sein."
+                )
             if student.number in numbers:
                 raise RegistryValidationError(
-                    f"Duplicate student number {student.number}."
+                    f"Doppelte Schülernummer {student.number}."
                 )
             numbers.add(student.number)
-            _clean_display(student.last_name, "last_name")
-            _clean_display(student.first_name, "first_name")
+            _clean_display(student.last_name, "Nachname")
+            _clean_display(student.first_name, "Vorname")
             if not isinstance(student.active, bool):
-                raise RegistryValidationError("active must be true or false.")
+                raise RegistryValidationError(
+                    "Der Aktiv-Status muss wahr oder falsch sein."
+                )
 
     def _write_aliases(self, aliases: Mapping[str, _Alias]) -> None:
         payload = {
@@ -848,12 +874,16 @@ class StudentRegistry:
                 pass
             if isinstance(exc, StudentRegistryError):
                 raise
-            raise RegistryWriteError(f"Could not atomically write {path}: {exc}") from exc
+            raise RegistryWriteError(
+                f"Datei {path} konnte nicht atomar gespeichert werden: {exc}"
+            ) from exc
 
     @classmethod
     def _create_backup(cls, path: Path) -> Path:
         if not path.exists():
-            raise RegistryValidationError(f"Cannot back up missing file: {path}")
+            raise RegistryValidationError(
+                f"Fehlende Datei kann nicht gesichert werden: {path}"
+            )
         candidate = path.with_name(f"{path.name}.bak")
         counter = 1
         while candidate.exists():
@@ -879,13 +909,15 @@ class StudentRegistry:
     def _require_available(self) -> None:
         if not self.is_available:
             raise RegistryUnavailableError(
-                self._load_error or "Student registry is unavailable."
+                self._load_error or "Das Schülerverzeichnis ist nicht verfügbar."
             )
 
     def _schema_or_raise(self) -> _CsvSchema:
         self._require_available()
         if self._schema is None:  # Defensive guard for type checkers and corruption.
-            raise RegistryUnavailableError("Student registry schema is unavailable.")
+            raise RegistryUnavailableError(
+                "Das Schema des Schülerverzeichnisses ist nicht verfügbar."
+            )
         return self._schema
 
 

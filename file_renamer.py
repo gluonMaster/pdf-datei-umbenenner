@@ -2,6 +2,8 @@
 Модуль для переименования файлов
 """
 
+import errno
+import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -46,9 +48,15 @@ class FileRenamer:
         
         return name
     
-    def generate_new_filename(self, surname: str, name: str, 
-                             subject: str, month: int = None, year: int = None,
-                             extension: str = '.pdf') -> str:
+    def generate_new_filename(
+        self,
+        surname: str,
+        name: str,
+        subject: str,
+        month: Optional[int] = None,
+        year: Optional[int] = None,
+        extension: str = ".pdf",
+    ) -> str:
         """
         Генерирует новое имя файла с учетом дубликатов
         
@@ -56,35 +64,35 @@ class FileRenamer:
             surname: Фамилия
             name: Имя
             subject: Дисциплина
-            month: Номер месяца (1-12), опционально
-            year: Год, опционально
+            month: Явно выбранный номер месяца (1-12)
+            year: Явно выбранный год
             extension: Расширение файла
             
         Returns:
-            Новое имя файла в формате: Nachname_Vorname_Fach[_Monat_Jahr].pdf
+            Новое имя файла в формате: Nachname_Vorname_Fach_Monat_Jahr.pdf
         """
-        # Очищаем компоненты имени
-        surname_clean = self.sanitize_filename(surname)
-        name_clean = self.sanitize_filename(name)
-        subject_clean = self.sanitize_filename(subject)
-        
-        # Базовое имя файла
-        base_name = f"{surname_clean}_{name_clean}_{subject_clean}"
-        
-        # Добавляем месяц и год, если указаны
-        if month is not None and year is not None:
-            if 1 <= month <= 12:
-                month_name = self.MONTH_NAMES_DE[month]
-                base_name = f"{base_name}_{month_name}_{year}"
+        if month is None or year is None:
+            raise ValueError("Monat und Jahr müssen ausdrücklich ausgewählt werden.")
+
+        canonical_name = self.build_filename(
+            surname,
+            name,
+            subject,
+            month,
+            year,
+            extension,
+        )
+        normalized_extension = extension if extension.startswith(".") else f".{extension}"
+        base_name = canonical_name[: -len(normalized_extension)]
         
         # Проверяем на дубликаты
         if base_name in self.renamed_files:
             self.renamed_files[base_name] += 1
             counter = self.renamed_files[base_name]
-            new_filename = f"{base_name}_{counter}{extension}"
+            new_filename = f"{base_name}_{counter}{normalized_extension}"
         else:
             self.renamed_files[base_name] = 0
-            new_filename = f"{base_name}{extension}"
+            new_filename = canonical_name
         
         self.processed_names.add(new_filename)
         return new_filename
@@ -100,10 +108,14 @@ class FileRenamer:
     ) -> str:
         """Build a canonical filename without making a collision decision."""
 
-        if month not in self.MONTH_NAMES_DE:
-            raise ValueError("month must be between 1 and 12")
+        if (
+            not isinstance(month, int)
+            or isinstance(month, bool)
+            or month not in self.MONTH_NAMES_DE
+        ):
+            raise ValueError("Monat muss zwischen 1 und 12 liegen.")
         if not isinstance(year, int) or isinstance(year, bool) or year < 1:
-            raise ValueError("year must be a positive integer")
+            raise ValueError("Jahr muss eine positive Ganzzahl sein.")
         if not extension.startswith("."):
             extension = f".{extension}"
 
@@ -115,7 +127,7 @@ class FileRenamer:
             str(year),
         )
         if any(not component for component in components):
-            raise ValueError("filename components must not be empty")
+            raise ValueError("Bestandteile des Dateinamens dürfen nicht leer sein.")
         return "_".join(components) + extension
 
     @staticmethod
@@ -128,6 +140,11 @@ class FileRenamer:
         """Start a new batch of collision planning."""
 
         self._reserved_paths.clear()
+
+    def release_target_path(self, target_path: Path) -> None:
+        """Release a failed real-operation reservation for deterministic retry."""
+
+        self._reserved_paths.discard(self._path_key(target_path))
 
     def reserve_target_path(
         self,
@@ -188,9 +205,12 @@ class FileRenamer:
             source_path=source_path,
         )
     
-    @staticmethod
-    def rename_file(source_path: Path, target_path: Path, 
-                   dry_run: bool = False) -> bool:
+    def rename_file(
+        self,
+        source_path: Path,
+        target_path: Path,
+        dry_run: bool = False,
+    ) -> bool:
         """
         Переименовывает файл
         
@@ -202,54 +222,160 @@ class FileRenamer:
         Returns:
             True если успешно
         """
+        source_path = Path(source_path)
+        target_path = Path(target_path)
         try:
             if dry_run:
                 print(f"  [Simulation] {source_path.name} -> {target_path.name}")
                 return True
 
-            if FileRenamer._path_key(source_path) == FileRenamer._path_key(target_path):
-                return True
-            
-            # Проверяем, что целевой файл не существует
-            if target_path.exists():
-                print(f"  Warnung: Datei {target_path.name} existiert bereits")
-                return False
-            
-            # Переименовываем
-            source_path.rename(target_path)
+            self._move_no_clobber(source_path, target_path)
             return True
-            
-        except Exception as e:
-            print(f"  Fehler beim Umbenennen: {str(e)}")
+
+        except FileExistsError:
+            self.release_target_path(target_path)
+            print(f"  Warnung: Datei {target_path.name} existiert bereits")
+            return False
+        except Exception as error:
+            self.release_target_path(target_path)
+            print(f"  Fehler beim Umbenennen: {error}")
             return False
 
-    @staticmethod
     def move_file(
+        self,
         source_path: Path,
         target_path: Path,
         dry_run: bool = False,
     ) -> bool:
         """Move a file to an already planned target without overwriting it."""
 
+        source_path = Path(source_path)
+        target_path = Path(target_path)
         try:
             if dry_run:
                 print(f"  [Simulation] {source_path} -> {target_path}")
                 return True
-            if FileRenamer._path_key(source_path) == FileRenamer._path_key(target_path):
-                return True
-            if target_path.exists():
-                print(f"  Warnung: Datei {target_path.name} existiert bereits")
-                return False
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source_path), str(target_path))
+            self._move_no_clobber(source_path, target_path)
             return True
+        except FileExistsError:
+            self.release_target_path(target_path)
+            print(f"  Warnung: Datei {target_path.name} existiert bereits")
+            return False
         except Exception as error:
+            self.release_target_path(target_path)
             print(f"  Fehler beim Verschieben: {error}")
             return False
-    
+
     @staticmethod
-    def move_to_folder(source_path: Path, target_folder: Path, 
-                      create_folder: bool = True) -> Path | None:
+    def _absolute_spelling(path: Path) -> str:
+        """Normalize a path without folding case or resolving its final name."""
+
+        return os.path.abspath(os.fspath(path))
+
+    @classmethod
+    def _same_spelling(cls, first: Path, second: Path) -> bool:
+        return cls._absolute_spelling(first) == cls._absolute_spelling(second)
+
+    @classmethod
+    def _is_case_only_same_file(cls, source_path: Path, target_path: Path) -> bool:
+        if cls._path_key(source_path) != cls._path_key(target_path):
+            return False
+        if not target_path.exists():
+            return False
+        try:
+            return os.path.samefile(source_path, target_path)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _copy_no_clobber(source_path: Path, target_path: Path) -> None:
+        """Cross-filesystem fallback that creates the destination exclusively."""
+
+        target_created = False
+        try:
+            with source_path.open("rb") as source_handle:
+                with target_path.open("xb") as target_handle:
+                    target_created = True
+                    shutil.copyfileobj(source_handle, target_handle)
+                    target_handle.flush()
+                    os.fsync(target_handle.fileno())
+            shutil.copystat(source_path, target_path)
+            source_path.unlink()
+        except Exception:
+            if target_created:
+                try:
+                    target_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+
+    @classmethod
+    def _move_no_clobber(cls, source_path: Path, target_path: Path) -> None:
+        """Move one file while atomically refusing an independently claimed target."""
+
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Quelldatei nicht gefunden: {source_path}")
+        if cls._same_spelling(source_path, target_path):
+            return
+
+        # On a case-insensitive filesystem the differently-cased target lookup
+        # resolves to the source itself.  This is the only existing target that
+        # may be renamed in place; a distinct target is always a collision.
+        if target_path.exists():
+            if cls._is_case_only_same_file(source_path, target_path):
+                os.rename(source_path, target_path)
+                return
+            raise FileExistsError(f"Zieldatei existiert bereits: {target_path}")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            try:
+                # Win32 rename is an atomic fail-if-exists operation.  Prefer
+                # it over link/unlink so read-only files retain normal rename
+                # behavior and cannot be left behind as duplicate hard links.
+                os.rename(source_path, target_path)
+                return
+            except FileExistsError:
+                raise
+            except OSError as error:
+                if target_path.exists():
+                    raise FileExistsError(
+                        f"Zieldatei existiert bereits: {target_path}"
+                    ) from error
+                if error.errno != errno.EXDEV and getattr(error, "winerror", None) != 17:
+                    raise
+            cls._copy_no_clobber(source_path, target_path)
+            return
+
+        linked = False
+        try:
+            # Hard-link creation is an atomic no-clobber claim on the common
+            # same-filesystem path.  Unlinking the old name completes the move.
+            os.link(source_path, target_path)
+            linked = True
+            source_path.unlink()
+            return
+        except FileExistsError:
+            raise
+        except OSError:
+            if linked:
+                try:
+                    target_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+        # Hard links may be unavailable (cross-volume, network filesystem, or
+        # policy).  Exclusive creation preserves no-clobber semantics there.
+        cls._copy_no_clobber(source_path, target_path)
+
+    def move_to_folder(
+        self,
+        source_path: Path,
+        target_folder: Path,
+        create_folder: bool = True,
+    ) -> Path | None:
         """
         Перемещает файл в указанную папку
         
@@ -261,6 +387,7 @@ class FileRenamer:
         Returns:
             Path к перемещённому файлу или None при ошибке
         """
+        target_path = None
         try:
             if create_folder:
                 target_folder.mkdir(parents=True, exist_ok=True)
@@ -273,6 +400,8 @@ class FileRenamer:
                 return None
             return target_path  # Возвращаем фактический путь
             
-        except Exception as e:
-            print(f"  Fehler beim Verschieben: {str(e)}")
+        except Exception as error:
+            if target_path is not None:
+                self.release_target_path(target_path)
+            print(f"  Fehler beim Verschieben: {error}")
             return None

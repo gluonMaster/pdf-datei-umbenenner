@@ -37,10 +37,17 @@ if not exist "%PROJECT_DIR%bootstrap.py" (
 if not exist "%VENV_PYTHON%" goto repair_missing_environment
 
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" requirements-current >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto repair_changed_requirements
+set "REQUIREMENTS_CODE=%ERRORLEVEL%"
+if "%REQUIREMENTS_CODE%"=="40" goto repair_changed_requirements
+if not "%REQUIREMENTS_CODE%"=="0" goto requirements_check_failed
 
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto repair_failed_health
+set "CORE_CODE=%ERRORLEVEL%"
+if "%CORE_CODE%"=="10" goto repair_failed_health
+if "%CORE_CODE%"=="20" goto repair_failed_health
+if "%CORE_CODE%"=="21" goto repair_failed_health
+if "%CORE_CODE%"=="22" goto repair_failed_health
+if not "%CORE_CODE%"=="0" goto core_data_failed
 
 echo OK: Das vorhandene .venv hat die schnelle Kernpruefung bestanden.
 goto environment_ready
@@ -56,6 +63,18 @@ goto repair_environment
 :repair_failed_health
 set "REPAIR_REASON=Die Kernpruefung ist fehlgeschlagen."
 goto repair_environment
+
+:requirements_check_failed
+set "FAIL_CODE=%REQUIREMENTS_CODE%"
+echo FEHLER: Der Requirements-Stand konnte nicht geprueft werden.
+echo Es wird keine Reparaturinstallation gestartet. Siehe Diagnoselog.
+goto launcher_failure
+
+:core_data_failed
+set "FAIL_CODE=%CORE_CODE%"
+echo FEHLER: Konfiguration oder Schuelerverzeichnis sind nicht lesbar.
+echo Eine Paketinstallation kann Benutzerdaten nicht reparieren und wird daher nicht gestartet.
+goto launcher_failure
 
 :repair_environment
 echo Reparatur erforderlich: %REPAIR_REASON%
@@ -135,9 +154,9 @@ if errorlevel 1 exit /b 50
 "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 exit /b 50
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
+if errorlevel 1 exit /b %ERRORLEVEL%
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" write-requirements-stamp >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
+if errorlevel 1 exit /b %ERRORLEVEL%
 exit /b 0
 
 :find_supported_python

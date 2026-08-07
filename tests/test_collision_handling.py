@@ -128,6 +128,18 @@ def test_collision_handling():
                 print("❌ ОБНАРУЖЕНЫ ДУБЛИКАТЫ ИМЁН")
         else:
             print("❌ НЕКОТОРЫЕ ФАЙЛЫ НЕ БЫЛИ ПЕРЕМЕЩЕНЫ")
+
+        assert all(path is not None and path.is_file() for path in moved_paths)
+        assert [path.name for path in moved_paths] == [
+            "collision_test.pdf",
+            "collision_test_1.pdf",
+            "collision_test_2.pdf",
+        ]
+        assert [path.read_text() for path in moved_paths] == [
+            "File 1",
+            "File 2",
+            "File 3",
+        ]
         print("=" * 60)
 
 
@@ -165,6 +177,11 @@ def test_move_to_folder_return_value():
                 print("❌ Файл не найден по возвращённому пути")
         else:
             print("❌ move_to_folder() вернул None (ошибка)")
+
+        assert isinstance(result, Path)
+        assert result.is_file()
+        assert result.read_text() == "Test content"
+        assert not test_file.exists()
     
     print("=" * 60)
 

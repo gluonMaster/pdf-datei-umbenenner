@@ -120,7 +120,7 @@ def test_corrupt_registry_returns_diagnostic_instead_of_crashing(tmp_path, conte
     assert not registry.is_available
     assert match.status == MatchStatus.ERROR
     assert match.student is None
-    assert "manual review" in match.reason.lower()
+    assert "manuell geprüft" in match.reason.casefold()
 
 
 def test_missing_registry_and_bad_alias_file_return_error_match(tmp_path):

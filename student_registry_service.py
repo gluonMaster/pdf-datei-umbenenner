@@ -124,7 +124,9 @@ class StudentRegistryService:
         """Filter by number/name with case and extra whitespace ignored."""
 
         if active is not None and not isinstance(active, bool):
-            raise RegistryValidationError("active filter must be true, false, or None.")
+            raise RegistryValidationError(
+                "Der Aktivfilter muss true, false oder None sein."
+            )
         needle = normalize_name(query)
         found = []
         for student in self.registry.students:
@@ -154,7 +156,7 @@ class StudentRegistryService:
         threshold: float = 0.86,
     ) -> Tuple[DuplicateCandidate, ...]:
         if not 0.0 <= threshold <= 1.0:
-            raise ValueError("threshold must be between 0 and 1.")
+            raise ValueError("Der Schwellenwert muss zwischen 0 und 1 liegen.")
         students = sorted(self.registry.students, key=lambda item: item.number)
         result = []
         for index, first in enumerate(students):
@@ -288,11 +290,12 @@ class StudentRegistryService:
 
         if not confirmed:
             raise RegistryValidationError(
-                "Import must be explicitly confirmed after reviewing the preview."
+                "Der Import muss nach Prüfung der Vorschau ausdrücklich bestätigt werden."
             )
         if preview.base_fingerprint != self._registry_fingerprint():
             raise RegistryValidationError(
-                "The student registry changed after the preview; create a new preview."
+                "Das Schülerverzeichnis wurde nach der Vorschau geändert; "
+                "bitte eine neue Vorschau erstellen."
             )
         backup = self.registry.merge_students(preview.new, create_backup=True)
         return ImportApplyResult(
@@ -307,7 +310,7 @@ class StudentRegistryService:
             data = self.registry.csv_path.read_bytes()
         except OSError as exc:
             raise RegistryValidationError(
-                f"Student registry cannot be read: {self.registry.csv_path}"
+                f"Schülerverzeichnis kann nicht gelesen werden: {self.registry.csv_path}"
             ) from exc
         return hashlib.sha256(data).hexdigest()
 
@@ -318,38 +321,48 @@ class StudentRegistryService:
     @staticmethod
     def _read_import(path: Path) -> tuple[Tuple[_ImportRow, ...], str]:
         if not path.is_file():
-            raise RegistryValidationError(f"Import CSV does not exist: {path}")
+            raise RegistryValidationError(f"Import-CSV ist nicht vorhanden: {path}")
         try:
             text = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
-            raise RegistryValidationError("Import CSV must use UTF-8 or UTF-8 BOM.") from exc
+            raise RegistryValidationError(
+                "Import-CSV muss UTF-8 oder UTF-8 mit BOM verwenden."
+            ) from exc
         except OSError as exc:
-            raise RegistryValidationError(f"Import CSV cannot be read: {path}") from exc
+            raise RegistryValidationError(
+                f"Import-CSV kann nicht gelesen werden: {path}"
+            ) from exc
         if not text.strip():
-            raise RegistryValidationError("Import CSV is empty.")
+            raise RegistryValidationError("Import-CSV ist leer.")
 
         delimiter = StudentRegistryService._detect_delimiter(text)
         reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
         if reader.fieldnames is None:
-            raise RegistryValidationError("Import CSV header is missing.")
+            raise RegistryValidationError("Kopfzeile der Import-CSV fehlt.")
 
         header_map: dict[str, str] = {}
         for raw_header in reader.fieldnames:
             clean_header = " ".join((raw_header or "").split())
             key = clean_header.casefold()
             if not key:
-                raise RegistryValidationError("Import CSV contains an empty header.")
+                raise RegistryValidationError(
+                    "Import-CSV enthält eine leere Spaltenüberschrift."
+                )
             if key in header_map:
-                raise RegistryValidationError("Import CSV contains duplicate headers.")
+                raise RegistryValidationError(
+                    "Import-CSV enthält doppelte Spaltenüberschriften."
+                )
             header_map[key] = raw_header
 
         required = {"nummer", "nachname"}
         if not required.issubset(header_map):
-            raise RegistryValidationError("Import CSV must contain Nummer and Nachname.")
+            raise RegistryValidationError(
+                "Import-CSV muss Nummer und Nachname enthalten."
+            )
         first_key = "vorname" if "vorname" in header_map else "forname"
         if first_key not in header_map:
             raise RegistryValidationError(
-                "Import CSV must contain Vorname or legacy Forname."
+                "Import-CSV muss Vorname oder die veraltete Spalte Forname enthalten."
             )
 
         imported = []
@@ -357,7 +370,7 @@ class StudentRegistryService:
             for row_number, row in enumerate(reader, start=2):
                 if None in row:
                     raise RegistryValidationError(
-                        f"Row {row_number} has more values than the header."
+                        f"Zeile {row_number} enthält mehr Werte als die Kopfzeile."
                     )
                 values = ["" if value is None else str(value) for value in row.values()]
                 if not any(value.strip() for value in values):
@@ -367,19 +380,19 @@ class StudentRegistryService:
                     number = int(str(raw_number).strip())
                 except (TypeError, ValueError) as exc:
                     raise RegistryValidationError(
-                        f"Row {row_number}: Nummer must be an integer."
+                        f"Zeile {row_number}: Nummer muss eine Ganzzahl sein."
                     ) from exc
                 if number <= 0:
                     raise RegistryValidationError(
-                        f"Row {row_number}: Nummer must be positive."
+                        f"Zeile {row_number}: Nummer muss positiv sein."
                     )
                 last_name = _clean_display(
                     row.get(header_map["nachname"], ""),
-                    f"row {row_number} Nachname",
+                    f"Zeile {row_number} Nachname",
                 )
                 first_name = _clean_display(
                     row.get(header_map[first_key], ""),
-                    f"row {row_number} {first_key}",
+                    f"Zeile {row_number} {first_key}",
                 )
                 active_value = row.get(header_map["aktiv"]) if "aktiv" in header_map else None
                 imported.append(
@@ -394,9 +407,11 @@ class StudentRegistryService:
                     )
                 )
         except csv.Error as exc:
-            raise RegistryValidationError(f"Import CSV is malformed: {exc}") from exc
+            raise RegistryValidationError(
+                f"Import-CSV ist fehlerhaft formatiert: {exc}"
+            ) from exc
         if not imported:
-            raise RegistryValidationError("Import CSV contains no student rows.")
+            raise RegistryValidationError("Import-CSV enthält keine Schülerzeilen.")
         return tuple(imported), delimiter
 
     @staticmethod
@@ -410,7 +425,8 @@ class StudentRegistryService:
             delimiter = max(counts, key=counts.get)
             if counts[delimiter] == 0:
                 raise RegistryValidationError(
-                    "Could not detect the CSV delimiter (supported: semicolon, comma, tab, pipe)."
+                    "CSV-Trennzeichen konnte nicht erkannt werden "
+                    "(unterstützt: Semikolon, Komma, Tabulator, senkrechter Strich)."
                 )
             return delimiter
 

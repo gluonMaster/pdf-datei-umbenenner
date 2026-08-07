@@ -120,7 +120,7 @@ class OCRFallbackExtractor:
         minimum_text_words: int = 3,
     ) -> None:
         if minimum_text_characters < 0 or minimum_text_words < 0:
-            raise ValueError("Text-layer thresholds must not be negative.")
+            raise ValueError("Grenzwerte für die Textebene dürfen nicht negativ sein.")
         self.text_extractor = text_extractor or PDFExtractor()
         if ocr_provider is None:
             from ocr import TesseractOCRProvider
@@ -145,7 +145,7 @@ class OCRFallbackExtractor:
             from ocr import OCRResult
 
             result = OCRResult.failed(
-                f"OCR failed: {str(error).strip() or error.__class__.__name__}"
+                f"OCR fehlgeschlagen: {str(error).strip() or error.__class__.__name__}"
             )
 
         if result.page_data is not None:

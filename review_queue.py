@@ -59,14 +59,78 @@ class ReviewItem:
         dataclass defaults above.
         """
         if not isinstance(data, dict):
-            raise TypeError("Review item must be a JSON object")
+            raise TypeError("Ein Warteschlangeneintrag muss ein JSON-Objekt sein")
         known_fields = {item.name for item in fields(cls)}
         payload = {key: value for key, value in data.items() if key in known_fields}
         payload.setdefault("suggestions", [])
         payload.setdefault("preview_text", "")
         payload.setdefault("parser_reasons", [])
         payload.setdefault("student_suggestions", [])
-        return cls(**payload)
+        item = cls(**payload)
+        item._validate_types()
+        return item
+
+    def _validate_types(self) -> None:
+        """Reject malformed queue entries before they reach the GUI or a save."""
+
+        if not isinstance(self.file_path, str) or not self.file_path.strip():
+            raise TypeError("'file_path' muss nichtleerer Text sein")
+        if not isinstance(self.reason, str):
+            raise TypeError("'reason' muss Text sein")
+        if not isinstance(self.preview_text, str):
+            raise TypeError("'preview_text' muss Text sein")
+
+        optional_text = (
+            "raw_name",
+            "raw_subject",
+            "form_type",
+            "student_match_status",
+            "canonical_name",
+            "canonical_subject",
+            "planned_filename",
+            "extraction_source",
+            "ocr_status",
+        )
+        for field_name in optional_text:
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"'{field_name}' muss Text oder null sein")
+
+        for field_name in ("suggestions", "parser_reasons", "student_suggestions"):
+            value = getattr(self, field_name)
+            if not isinstance(value, list) or not all(
+                isinstance(entry, str) for entry in value
+            ):
+                raise TypeError(f"'{field_name}' muss eine Textliste sein")
+
+        if self.canonical_student_number is not None and (
+            not isinstance(self.canonical_student_number, int)
+            or isinstance(self.canonical_student_number, bool)
+        ):
+            raise TypeError("'canonical_student_number' muss eine Ganzzahl oder null sein")
+        if self.selected_month is not None and (
+            not isinstance(self.selected_month, int)
+            or isinstance(self.selected_month, bool)
+            or not 1 <= self.selected_month <= 12
+        ):
+            raise TypeError("'selected_month' muss eine Ganzzahl von 1 bis 12 oder null sein")
+        if self.selected_year is not None and (
+            not isinstance(self.selected_year, int)
+            or isinstance(self.selected_year, bool)
+            or self.selected_year < 1
+        ):
+            raise TypeError("'selected_year' muss eine positive Ganzzahl oder null sein")
+
+        for field_name in (
+            "parser_confidence",
+            "ocr_name_confidence",
+            "ocr_subject_confidence",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and (
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+            ):
+                raise TypeError(f"'{field_name}' muss eine Zahl oder null sein")
 
 
 class ReviewStore:
@@ -83,8 +147,11 @@ class ReviewStore:
         if store_path is None:
             store_path = Path(__file__).parent / "manual_review.json"
         
-        self.store_path = store_path
+        self.store_path = Path(store_path)
         self.items: List[ReviewItem] = []
+        # A damaged queue must never be treated as an intentionally empty one:
+        # doing so would let the next save overwrite the only recovery source.
+        self.load_error: Optional[str] = None
     
     def add(self, item: ReviewItem) -> None:
         """
@@ -95,34 +162,42 @@ class ReviewStore:
         """
         self.items.append(item)
     
-    def load(self) -> None:
+    def load(self) -> bool:
         """
         Загружает очередь из файла
         
-        Если файл не существует или поврежден, создает пустую очередь
+        Если файла нет, начинает с пустой очереди. Повреждённый файл
+        переводит хранилище в fail-closed режим без права перезаписи.
         """
         self.items = []
-        
+        self.load_error = None
+
         if not self.store_path.exists():
-            return
-        
+            return True
+
         try:
             with open(self.store_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
-            # Преобразуем список словарей в список ReviewItem
-            for item_dict in data.get('review_items', []):
-                try:
-                    item = ReviewItem.from_dict(item_dict)
-                    self.items.append(item)
-                except (TypeError, KeyError) as e:
-                    # Пропускаем поврежденные записи
-                    print(f"Warnung: Beschaedigter Eintrag uebersprungen: {e}")
-                    continue
-                    
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warnung: Fehler beim Laden von {self.store_path.name}: {e}")
+
+            if not isinstance(data, dict):
+                raise TypeError("JSON-Wurzel muss ein Objekt sein")
+            if 'review_items' not in data:
+                raise TypeError("Pflichtfeld 'review_items' fehlt")
+            raw_items = data['review_items']
+            if not isinstance(raw_items, list):
+                raise TypeError("'review_items' muss eine Liste sein")
+
+            loaded_items = [ReviewItem.from_dict(item_dict) for item_dict in raw_items]
+            self.items = loaded_items
+            return True
+        except (json.JSONDecodeError, OSError, UnicodeError, TypeError, ValueError) as e:
             self.items = []
+            self.load_error = (
+                f"Warteschlange '{self.store_path.name}' ist beschädigt oder nicht lesbar: {e}. "
+                "Die Datei wird nicht überschrieben."
+            )
+            print(f"Fehler: {self.load_error}")
+            return False
     
     def save(self) -> bool:
         """
@@ -131,6 +206,10 @@ class ReviewStore:
         Returns:
             True если сохранение прошло успешно, False в случае ошибки
         """
+        if self.load_error:
+            print(f"Fehler: {self.load_error}")
+            return False
+
         try:
             data = {
                 'review_items': [item.to_dict() for item in self.items]

@@ -92,15 +92,15 @@ def _check_subjects_config(project_root):
         with config_path.open("r", encoding="utf-8-sig") as config_file:
             config = json.load(config_file)
         if not isinstance(config, dict):
-            raise ValueError("the root value must be an object")
+            raise ValueError("JSON-Wurzel muss ein Objekt sein")
         subjects = config.get("subjects")
         aliases = config.get("aliases")
         if not isinstance(subjects, list) or not subjects:
-            raise ValueError("subjects must be a non-empty list")
+            raise ValueError("'subjects' muss eine nichtleere Liste sein")
         if not all(isinstance(item, str) and item.strip() for item in subjects):
-            raise ValueError("every subject must be non-empty text")
+            raise ValueError("jedes Fach muss nichtleerer Text sein")
         if not isinstance(aliases, dict):
-            raise ValueError("aliases must be an object")
+            raise ValueError("'aliases' muss ein Objekt sein")
         if not all(
             isinstance(alias, str)
             and alias.strip()
@@ -108,7 +108,7 @@ def _check_subjects_config(project_root):
             and subject.strip()
             for alias, subject in aliases.items()
         ):
-            raise ValueError("every alias and target must be non-empty text")
+            raise ValueError("Alias und Ziel müssen jeweils nichtleerer Text sein")
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         detail = str(error).strip() or error.__class__.__name__
         print("CONFIG_UNREADABLE: Konfiguration unlesbar: " + str(config_path) + " (" + detail + ").")
@@ -124,7 +124,7 @@ def _check_student_registry(project_root):
 
         registry = StudentRegistry(registry_path, aliases_path)
         if not registry.is_available:
-            raise ValueError(registry.load_error or "unknown registry error")
+            raise ValueError(registry.load_error or "unbekannter Verzeichnisfehler")
         if not registry.students:
             raise ValueError("the registry contains no students")
     except Exception as error:
@@ -222,11 +222,10 @@ def check_ocr(project_root=PROJECT_ROOT):
         return ExitCode.OK
 
     message = availability.message
-    lowered = message.casefold()
-    if "executable was not found" in lowered:
+    if availability.executable is None:
         code = ExitCode.TESSERACT_UNAVAILABLE
         category = "TESSERACT_UNAVAILABLE"
-    elif "missing tesseract language data" in lowered:
+    elif availability.missing_languages:
         code = ExitCode.OCR_LANGUAGE_DATA_UNAVAILABLE
         category = "OCR_LANGUAGE_DATA_UNAVAILABLE"
     else:

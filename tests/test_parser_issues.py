@@ -17,12 +17,17 @@ def test_current_parser_logic():
     """Тестируем текущую логику парсера"""
     
     test_lines = [
-        "Beispielenko Vitalii Chemie",
-        "Musterenko Elina Englisch", 
-        "Probenko Anton Mathe"
+        "Sample Student Chemie",
+        "Example Learner Englisch",
+        "Public Pupil Mathe",
     ]
     
     parser = TextParser()
+    expected = {
+        "Sample Student Chemie": ("Sample Student", "Chemie"),
+        "Example Learner Englisch": ("Example Learner", "Englisch"),
+        "Public Pupil Mathe": ("Public Pupil", "Mathematik"),
+    }
     
     print("🔍 ТЕСТИРОВАНИЕ ТЕКУЩЕГО ПАРСЕРА")
     print("="*50)
@@ -59,6 +64,8 @@ def test_current_parser_logic():
         
         if "mathe" in line.lower():
             print(f"  ❌ 'Mathe' не в списке валидных дисциплин")
+
+        assert parser.parse_document(line) == expected[line]
         
         print("-" * 30)
 
@@ -67,9 +74,9 @@ def test_proposed_solutions():
     """Тестируем предлагаемые решения"""
     
     test_lines = [
-        "Beispielenko Vitalii Chemie",
-        "Musterenko Elina Englisch", 
-        "Probenko Anton Mathe"
+        "Sample Student Chemie",
+        "Example Learner Englisch",
+        "Public Pupil Mathe",
     ]
     
     print("\n\n🛠️  ТЕСТИРОВАНИЕ ПРЕДЛАГАЕМЫХ РЕШЕНИЙ")
@@ -83,6 +90,7 @@ def test_proposed_solutions():
         'Mathe'  # Добавляем сокращение
     ]
     
+    parsed_rows = []
     for line in test_lines:
         print(f"\nТестируем строку: '{line}'")
         words = line.split()
@@ -97,6 +105,15 @@ def test_proposed_solutions():
                 print(f"  ✓ Дисциплина найдена в расширенном списке")
             else:
                 print(f"  ❌ Дисциплина НЕ найдена")
+
+            assert subject in extended_subjects
+            parsed_rows.append((f"{surname} {name}", subject))
+
+    assert parsed_rows == [
+        ("Sample Student", "Chemie"),
+        ("Example Learner", "Englisch"),
+        ("Public Pupil", "Mathe"),
+    ]
 
 
 def test_subject_normalization():
@@ -140,7 +157,7 @@ def test_subject_normalization():
     print(f"\n📊 Результаты: {passed} пройдено, {failed} провалено")
     print("-" * 50)
     
-    return failed == 0
+    assert failed == 0, f"Не прошло проверок нормализации: {failed}"
 
 
 def test_subject_suggestions():
@@ -194,7 +211,7 @@ def test_subject_suggestions():
     print(f"\n📊 Результаты: {passed} пройдено, {failed} провалено")
     print("-" * 50)
     
-    return failed == 0
+    assert failed == 0, f"Не прошло проверок подсказок: {failed}"
 
 
 def test_alias_priority():
@@ -237,7 +254,7 @@ def test_alias_priority():
     print(f"\n📊 Результаты: {passed} пройдено, {failed} провалено")
     print("-" * 50)
     
-    return failed == 0
+    assert failed == 0, f"Не прошло проверок алиасов: {failed}"
 
 
 def run_all_smoke_tests():
@@ -255,8 +272,8 @@ def run_all_smoke_tests():
     results = []
     for test_name, test_func in tests:
         try:
-            result = test_func()
-            results.append((test_name, result))
+            test_func()
+            results.append((test_name, True))
         except Exception as e:
             print(f"\n❌ Тест '{test_name}' завершился с ошибкой: {e}")
             results.append((test_name, False))

@@ -36,6 +36,7 @@ class OCRAvailability:
     message: str
     executable: Optional[Path] = None
     languages: Tuple[str, ...] = ()
+    missing_languages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ class OCRResult:
     def success(
         cls,
         page_data: PageData,
-        message: str = "OCR fallback completed.",
+        message: str = "OCR-Erkennung erfolgreich abgeschlossen.",
     ) -> "OCRResult":
         return cls(OCRStatus.SUCCESS, page_data, message)
 
@@ -100,14 +101,14 @@ def ocr_words_to_page_data(
     page_width: float,
     page_height: float,
     text: Optional[str] = None,
-    diagnostic: str = "OCR fallback completed.",
+    diagnostic: str = "OCR-Erkennung erfolgreich abgeschlossen.",
 ) -> PageData:
     """Scale image-pixel OCR boxes into top-origin PDF page coordinates."""
 
     if image_width <= 0 or image_height <= 0:
-        raise ValueError("OCR image dimensions must be positive.")
+        raise ValueError("Die Abmessungen des OCR-Bildes müssen positiv sein.")
     if page_width <= 0 or page_height <= 0:
-        raise ValueError("PDF page dimensions must be positive.")
+        raise ValueError("Die Abmessungen der PDF-Seite müssen positiv sein.")
 
     items = tuple(words)
     scale_x = page_width / image_width
@@ -164,7 +165,7 @@ class TesseractOCRProvider(OCRProvider):
         page_segmentation_mode: int = 6,
     ) -> None:
         if dpi <= 0:
-            raise ValueError("OCR DPI must be positive.")
+            raise ValueError("Die OCR-Auflösung (DPI) muss positiv sein.")
         requested_languages = tuple(
             dict.fromkeys(
                 str(language).strip()
@@ -173,7 +174,7 @@ class TesseractOCRProvider(OCRProvider):
             )
         )
         if not requested_languages:
-            raise ValueError("At least one OCR language must be configured.")
+            raise ValueError("Mindestens eine OCR-Sprache muss konfiguriert sein.")
         self.configured_executable = (
             Path(executable_path).expanduser() if executable_path else None
         )
@@ -186,8 +187,9 @@ class TesseractOCRProvider(OCRProvider):
         if executable is None:
             return OCRAvailability(
                 False,
-                "OCR unavailable: Tesseract executable was not found in the setting, "
-                "TESSERACT_CMD, PATH, or standard install locations.",
+                "OCR ist nicht verfügbar: Tesseract wurde weder in den Einstellungen "
+                "noch über TESSERACT_CMD, PATH oder die Standard-Installationsordner "
+                "gefunden.",
             )
 
         try:
@@ -195,8 +197,8 @@ class TesseractOCRProvider(OCRProvider):
         except ImportError:
             return OCRAvailability(
                 False,
-                "OCR unavailable: optional PyMuPDF renderer is not installed "
-                "(install requirements-ocr.txt).",
+                "OCR ist nicht verfügbar: Der optionale PyMuPDF-Renderer ist nicht "
+                "installiert (requirements-ocr.txt installieren).",
                 executable,
             )
         del module
@@ -206,16 +208,18 @@ class TesseractOCRProvider(OCRProvider):
         except (OSError, subprocess.SubprocessError) as error:
             return OCRAvailability(
                 False,
-                f"OCR unavailable: Tesseract could not be queried ({error}).",
+                f"OCR ist nicht verfügbar: Tesseract konnte nicht abgefragt werden "
+                f"({error}).",
                 executable,
             )
         if completed.returncode != 0:
             detail = (
-                self._decode(completed.stderr).strip() or "unknown Tesseract error"
+                self._decode(completed.stderr).strip() or "unbekannter Tesseract-Fehler"
             )
             return OCRAvailability(
                 False,
-                f"OCR unavailable: language data query failed ({detail}).",
+                f"OCR ist nicht verfügbar: Die Abfrage der Sprachdaten ist "
+                f"fehlgeschlagen ({detail}).",
                 executable,
             )
 
@@ -226,15 +230,16 @@ class TesseractOCRProvider(OCRProvider):
         if missing:
             return OCRAvailability(
                 False,
-                "OCR unavailable: missing Tesseract language data: "
+                "OCR ist nicht verfügbar: Folgende Tesseract-Sprachdaten fehlen: "
                 + ", ".join(missing)
                 + ".",
                 executable,
                 installed,
+                missing,
             )
         return OCRAvailability(
             True,
-            "Tesseract and configured language data are available.",
+            "Tesseract und die konfigurierten Sprachdaten sind verfügbar.",
             executable,
             installed,
         )
@@ -272,12 +277,14 @@ class TesseractOCRProvider(OCRProvider):
             if completed.returncode != 0:
                 detail = (
                     self._decode(completed.stderr).strip()
-                    or "unknown Tesseract error"
+                    or "unbekannter Tesseract-Fehler"
                 )
-                return OCRResult.failed(f"OCR failed: {detail}")
+                return OCRResult.failed(f"OCR fehlgeschlagen: {detail}")
             words = self._parse_tsv(self._decode(completed.stdout))
             if not words:
-                return OCRResult.failed("OCR failed: Tesseract returned no printed words.")
+                return OCRResult.failed(
+                    "OCR fehlgeschlagen: Tesseract hat keine Wörter erkannt."
+                )
             page_data = ocr_words_to_page_data(
                 words,
                 image_width=image_width,
@@ -288,7 +295,7 @@ class TesseractOCRProvider(OCRProvider):
             return OCRResult.success(page_data)
         except Exception as error:
             return OCRResult.failed(
-                f"OCR failed: {str(error).strip() or error.__class__.__name__}"
+                f"OCR fehlgeschlagen: {str(error).strip() or error.__class__.__name__}"
             )
 
     def _find_executable(self) -> Optional[Path]:
@@ -324,7 +331,7 @@ class TesseractOCRProvider(OCRProvider):
                 return importlib.import_module(module_name)
             except ImportError:
                 continue
-        raise ImportError("PyMuPDF is not installed")
+        raise ImportError("PyMuPDF ist nicht installiert.")
 
     def _render_first_page(
         self,
@@ -334,7 +341,7 @@ class TesseractOCRProvider(OCRProvider):
         document = pymupdf.open(str(pdf_path))
         try:
             if len(document) == 0:
-                raise ValueError("PDF contains no pages.")
+                raise ValueError("PDF enthält keine Seiten.")
             page = document[0]
             scale = self.dpi / 72.0
             matrix = pymupdf.Matrix(scale, scale)

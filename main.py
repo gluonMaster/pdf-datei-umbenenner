@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 from typing import List, Optional, Tuple
 
+from alias_manager import AliasManager
 from file_renamer import FileRenamer
 from form_parser import FormParser
 from ocr import TesseractOCRProvider
@@ -20,6 +21,7 @@ from processing_service import (
 from review_queue import ReviewStore
 from student_registry import StudentRegistry
 from student_registry_service import StudentRegistryPaths
+from text_parser import TextParser
 from validator import Validator
 
 
@@ -46,6 +48,15 @@ class PDFRenamerApp:
 
         if service is None:
             project_folder = Path(__file__).parent
+            # Explicitly bind the parser to this application's alias store.
+            # This prevents a GUI or test created earlier in the same Python
+            # process from leaking its singleton manager into the CLI.
+            TextParser.set_alias_manager(
+                AliasManager(
+                    project_folder / "subjects_aliases.json",
+                    create_if_missing=False,
+                )
+            )
             registry_paths = StudentRegistryPaths.in_directory(project_folder)
             review_store = ReviewStore(self.input_folder / "manual_review.json")
             review_store.load()
@@ -92,6 +103,9 @@ class PDFRenamerApp:
     def process_file(self, pdf_path: Path) -> Tuple[bool, str]:
         """Compatibility wrapper around the one-document service method."""
 
+        if self.review_store.load_error:
+            return False, self.review_store.load_error
+
         result = self.service.process_document(
             pdf_path,
             self.month,
@@ -116,6 +130,14 @@ class PDFRenamerApp:
         print(f"Zeitraum: {self.month:02d}/{self.year}")
         if self.dry_run:
             print("MODUS: Simulation (keine Änderungen)")
+
+        if self.review_store.load_error:
+            print(f"Fehler: {self.review_store.load_error}")
+            return BatchProcessingResult(
+                (),
+                review_queue_saved=False,
+                review_queue_error=self.review_store.load_error,
+            )
 
         pdf_files = self.find_pdf_files()
         if not pdf_files:
@@ -220,7 +242,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: Optional[list[str]] = None) -> int:
     # The application contains German/Russian diagnostics; do not let a legacy
     # Windows code page make even ``--help`` crash on an umlaut.
     for stream in (sys.stdout, sys.stderr):
@@ -240,8 +262,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             PDFRenamerGUI().run()
         except ImportError:
             print("Fehler: GUI-Komponenten nicht verfügbar!")
-            sys.exit(1)
-        return
+            return 1
+        return 0
 
     if args.month is None or args.year is None:
         parser.error("für die CLI-Verarbeitung sind --month und --year erforderlich")
@@ -259,8 +281,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         year=args.year,
         tesseract_path=args.tesseract_path,
     )
-    app.run()
+    batch = app.run()
+    return 2 if batch.errors or batch.review_queue_error else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

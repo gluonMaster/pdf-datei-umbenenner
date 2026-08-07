@@ -10,23 +10,27 @@ def test_suggest_subjects():
     print("=== Тест метода suggest_subjects() ===\n")
     
     test_cases = [
-        ("Mathemat", "Частичное совпадение"),
-        ("Phisik", "Опечатка в Physik"),
-        ("Chemie", "Точное совпадение (не должно выдавать подсказки в валидации)"),
-        ("Biologi", "Частичное совпадение"),
-        ("Geschichte", "Полностью неизвестная дисциплина"),
-        ("Englis", "Частичное совпадение"),
-        ("Math", "Короткое сокращение"),
-        ("Geogr", "Частичное совпадение"),
+        ("Mathemat", "Mathematik", "Частичное совпадение"),
+        ("Phisik", "Physik", "Опечатка в Physik"),
+        ("Chemie", "Chemie", "Точное совпадение"),
+        ("Biologi", "Biologie", "Частичное совпадение"),
+        ("Geschichte", None, "Полностью неизвестная дисциплина"),
+        ("Englis", "Englisch", "Частичное совпадение"),
+        ("Math", "Mathe", "Короткое сокращение"),
+        ("Geogr", "Geo", "Частичное совпадение"),
     ]
     
-    for subject, description in test_cases:
+    for subject, expected_first, description in test_cases:
         suggestions = Validator.suggest_subjects(subject, limit=5)
         print(f"Ввод: '{subject}' ({description})")
         if suggestions:
             print(f"  Подсказки: {', '.join(suggestions)}")
         else:
             print(f"  Подсказки: нет близких совпадений")
+        if expected_first is None:
+            assert suggestions == []
+        else:
+            assert suggestions and suggestions[0] == expected_first
         print()
 
 
@@ -113,6 +117,7 @@ def test_cutoff_threshold():
         suggestions = Validator.suggest_subjects(subject, limit=5)
         print(f"Ввод: '{subject}'")
         print(f"  Подсказки: {suggestions if suggestions else 'нет (cutoff не пройден)'}")
+        assert suggestions == []
         print()
 
 

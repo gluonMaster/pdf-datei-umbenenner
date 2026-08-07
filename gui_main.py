@@ -52,6 +52,9 @@ class PDFRenamerGUI:
         self.selected_year = tk.IntVar(value=now.year)
         self.progress_var = tk.DoubleVar(value=0)
         self.processing = False
+        self._close_requested = False
+        self._active_batch_folder = None
+        self._batch_queue_failed = False
         self.stop_event = threading.Event()
         self.worker_events: queue.Queue = queue.Queue()
 
@@ -85,7 +88,10 @@ class PDFRenamerGUI:
         self.load_subjects_config()
         self.stats = self._empty_stats()
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain_worker_events)
+        if self.alias_manager.load_error:
+            self.root.after(0, self._show_alias_load_error)
 
     @staticmethod
     def _empty_stats() -> dict[str, int]:
@@ -127,30 +133,41 @@ class PDFRenamerGUI:
         folder_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         folder_frame.columnconfigure(1, weight=1)
         ttk.Label(folder_frame, text="Eingabeordner:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(folder_frame, textvariable=self.selected_folder, width=50).grid(
+        self.folder_entry = ttk.Entry(
+            folder_frame, textvariable=self.selected_folder, width=50
+        )
+        self.folder_entry.grid(
             row=0, column=1, padx=10, sticky=(tk.W, tk.E)
         )
-        ttk.Button(folder_frame, text="Durchsuchen...", command=self.browse_folder).grid(
-            row=0, column=2
+        self.browse_button = ttk.Button(
+            folder_frame, text="Durchsuchen...", command=self.browse_folder
         )
+        self.browse_button.grid(row=0, column=2)
 
         settings = ttk.LabelFrame(frame, text="Einstellungen", padding="10")
         settings.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        ttk.Checkbutton(
+        self.dry_run_check = ttk.Checkbutton(
             settings,
             text="Testmodus (keine Änderungen)",
             variable=self.dry_run_mode,
-        ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8))
+        )
+        self.dry_run_check.grid(
+            row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8)
+        )
         ttk.Label(settings, text="Monat:").grid(row=1, column=0, sticky=tk.W)
-        ttk.Combobox(
+        self.month_combo = ttk.Combobox(
             settings,
             textvariable=self.selected_month,
             values=list(range(1, 13)),
             state="readonly",
             width=10,
-        ).grid(row=1, column=1, sticky=tk.W, padx=(8, 25))
+        )
+        self.month_combo.grid(row=1, column=1, sticky=tk.W, padx=(8, 25))
         ttk.Label(settings, text="Jahr:").grid(row=1, column=2, sticky=tk.W)
-        ttk.Entry(settings, textvariable=self.selected_year, width=10).grid(
+        self.year_entry = ttk.Entry(
+            settings, textvariable=self.selected_year, width=10
+        )
+        self.year_entry.grid(
             row=1, column=3, sticky=tk.W, padx=(8, 0)
         )
 
@@ -371,6 +388,7 @@ class PDFRenamerGUI:
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(8, 4))
+        self.student_mutation_buttons = []
         for text, command in (
             ("Neu", self.add_student),
             ("Bearbeiten", self.edit_student),
@@ -380,9 +398,18 @@ class PDFRenamerGUI:
             ("CSV importieren…", self.import_students_csv),
             ("Aktualisieren", self.load_students_table),
         ):
-            ttk.Button(buttons, text=text, command=command).pack(
+            button = ttk.Button(buttons, text=text, command=command)
+            button.pack(
                 side=tk.LEFT, padx=(0, 6)
             )
+            if text in {
+                "Neu",
+                "Bearbeiten",
+                "Aktivieren / Deaktivieren",
+                "Aliase",
+                "CSV importieren…",
+            }:
+                self.student_mutation_buttons.append(button)
 
         self.student_registry_status = ttk.Label(frame, text="")
         self.student_registry_status.grid(row=3, column=0, sticky=tk.W)
@@ -390,6 +417,15 @@ class PDFRenamerGUI:
 
     def _student_filter_value(self):
         return {"Aktiv": True, "Inaktiv": False}.get(self.student_active_filter.get())
+
+    def _ensure_idle(self) -> bool:
+        if not self.processing:
+            return True
+        messagebox.showwarning(
+            "Verarbeitung läuft",
+            "Diese Änderung ist erst nach dem Batch-Ende möglich.",
+        )
+        return False
 
     def load_students_table(self, _event=None):
         if not hasattr(self, "student_tree"):
@@ -474,8 +510,12 @@ class PDFRenamerGUI:
         return result[0] if result else None
 
     def add_student(self):
+        if not self._ensure_idle():
+            return
         values = self._show_student_editor("Neuen Schüler anlegen")
         if values is None:
+            return
+        if not self._ensure_idle():
             return
         try:
             student = self.student_registry.add_student(
@@ -487,12 +527,16 @@ class PDFRenamerGUI:
         self._after_student_change(student.number)
 
     def edit_student(self):
+        if not self._ensure_idle():
+            return
         number = self._selected_student_number()
         if number is None:
             return
         student = self.student_registry.select_existing(number)
         values = self._show_student_editor("Schüler bearbeiten", student)
         if values is None:
+            return
+        if not self._ensure_idle():
             return
         try:
             self.student_registry.update_student(
@@ -507,6 +551,8 @@ class PDFRenamerGUI:
         self._after_student_change(number)
 
     def toggle_student_active(self):
+        if not self._ensure_idle():
+            return
         number = self._selected_student_number()
         if number is None:
             return
@@ -533,6 +579,8 @@ class PDFRenamerGUI:
             self._update_student_choices(current)
 
     def show_student_aliases(self):
+        if not self._ensure_idle():
+            return
         number = self._selected_student_number()
         if number is None:
             return
@@ -554,6 +602,8 @@ class PDFRenamerGUI:
                 alias_tree.insert("", tk.END, iid=str(position), values=(alias.name,))
 
         def remove_selected():
+            if not self._ensure_idle():
+                return
             selected = alias_tree.selection()
             if not selected:
                 messagebox.showwarning("Alias", "Bitte wählen Sie einen Alias aus.", parent=dialog)
@@ -601,6 +651,8 @@ class PDFRenamerGUI:
         ttk.Button(dialog, text="Schließen", command=dialog.destroy).pack(pady=(0, 10))
 
     def import_students_csv(self):
+        if not self._ensure_idle():
+            return
         source = filedialog.askopenfilename(
             title="Neue Schülerliste auswählen",
             filetypes=(("CSV-Dateien", "*.csv"), ("Alle Dateien", "*.*")),
@@ -678,6 +730,8 @@ class PDFRenamerGUI:
         actions.grid(row=3, column=0, sticky=tk.E, padx=10, pady=(4, 10))
 
         def apply_preview():
+            if not self._ensure_idle():
+                return
             if not messagebox.askyesno(
                 "Import bestätigen",
                 f"{len(preview.new)} neue Schüler jetzt importieren?",
@@ -715,14 +769,31 @@ class PDFRenamerGUI:
         return label
 
     def browse_folder(self):
+        if not self._ensure_idle():
+            return
         folder = filedialog.askdirectory(title="Wählen Sie den Ordner mit PDF-Dateien")
         if not folder:
             return
         self.selected_folder.set(folder)
         self.review_store.store_path = Path(folder) / "manual_review.json"
-        self.review_store.load()
+        loaded = self.review_store.load()
+        if not loaded:
+            self._show_review_load_error()
         self.load_review_queue(reload_store=False)
         self.log_message(f"Ordner ausgewählt: {folder}")
+
+    def _show_review_load_error(self):
+        detail = self.review_store.load_error or "Unbekannter Lesefehler."
+        self.log_message(f"❌ {detail}")
+        messagebox.showerror("Warteschlange nicht geladen", detail)
+
+    def _show_alias_load_error(self):
+        detail = self.alias_manager.load_error or "Unbekannter Lesefehler."
+        self.log_message(f"❌ {detail}")
+        messagebox.showwarning(
+            "Fachaliase nicht geladen",
+            detail + "\nBekannte Fächer funktionieren weiterhin; neue Aliase werden nicht gespeichert.",
+        )
 
     def log_message(self, message):
         timestamp = time.strftime("%H:%M:%S")
@@ -744,14 +815,35 @@ class PDFRenamerGUI:
         self.stats_text.insert(1.0, text)
         self.stats_text.config(state=tk.DISABLED)
 
-    def load_review_queue(self, reload_store=True):
-        if reload_store:
-            folder = self.selected_folder.get().strip()
-            if folder:
-                self.review_store.store_path = Path(folder) / "manual_review.json"
-            self.review_store.load()
+    def load_review_queue(
+        self,
+        reload_store=True,
+        *,
+        store_path_override=None,
+        allow_during_processing=False,
+    ):
+        if self.processing and reload_store and not allow_during_processing:
+            messagebox.showwarning(
+                "Verarbeitung läuft",
+                "Die Warteschlange wird nach dem Batch-Ende aktualisiert.",
+            )
+            return False
+        # A reload may switch to another folder containing the same relative
+        # filename.  Never keep the old ReviewItem or edited values attached
+        # to the newly displayed row.
+        self.clear_edit_fields()
         for tree_item in self.review_tree.get_children():
             self.review_tree.delete(tree_item)
+        if reload_store:
+            if store_path_override is not None:
+                self.review_store.store_path = Path(store_path_override)
+            else:
+                folder = self.selected_folder.get().strip()
+                if folder:
+                    self.review_store.store_path = Path(folder) / "manual_review.json"
+            if not self.review_store.load():
+                self._show_review_load_error()
+                return False
         for item in self.review_store.get_all():
             self.review_tree.insert(
                 "",
@@ -764,6 +856,7 @@ class PDFRenamerGUI:
                 ),
                 tags=(item.file_path,),
             )
+        return True
 
     def on_review_item_selected(self, _event=None):
         selection = self.review_tree.selection()
@@ -933,11 +1026,15 @@ class PDFRenamerGUI:
             self.load_review_queue(reload_store=True)
             self.clear_edit_fields()
         elif result.status == ReviewActionStatus.PARTIAL:
+            self.load_review_queue(reload_store=False)
+            self.clear_edit_fields()
             messagebox.showwarning("Teilweise ausgeführt", result.message)
         else:
             messagebox.showerror("Fehler", result.message)
 
     def remove_from_queue(self):
+        if not self._ensure_idle():
+            return
         if not self.current_review_item:
             messagebox.showwarning("Warnung", "Bitte wählen Sie eine Datei aus.")
             return
@@ -946,8 +1043,18 @@ class PDFRenamerGUI:
         ):
             return
         previous = self.review_store.get_all()
-        removed = self.review_store.remove(self.current_review_item.file_path)
-        if not removed or not self.review_store.save():
+        try:
+            removed = self.review_store.remove(self.current_review_item.file_path)
+            saved = bool(removed and self.review_store.save())
+        except Exception as error:
+            self.review_store.items = previous
+            messagebox.showerror(
+                "Fehler",
+                "Warteschlange konnte nicht gespeichert werden: "
+                + (str(error) or error.__class__.__name__),
+            )
+            return
+        if not saved:
             self.review_store.items = previous
             messagebox.showerror("Fehler", "Warteschlange konnte nicht gespeichert werden.")
             return
@@ -1009,20 +1116,35 @@ class PDFRenamerGUI:
             bool(self.dry_run_mode.get()),
         )
         self.review_store.store_path = settings.folder / "manual_review.json"
-        self.review_store.load()
+        if not self.review_store.load():
+            self._show_review_load_error()
+            return
         self.stats = self._empty_stats()
         self.update_statistics()
         self.progress_var.set(0)
         self.processing = True
+        self._active_batch_folder = settings.folder
+        self._batch_queue_failed = False
         self.stop_event.clear()
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self.processing_thread = threading.Thread(
-            target=self.batch_runner.run,
-            args=(settings, self.stop_event, self.worker_events.put),
-            daemon=True,
-        )
-        self.processing_thread.start()
+        self._set_batch_controls(True)
+        try:
+            self.processing_thread = threading.Thread(
+                target=self.batch_runner.run,
+                args=(settings, self.stop_event, self.worker_events.put),
+                daemon=True,
+            )
+            self.processing_thread.start()
+        except Exception as error:
+            self.processing = False
+            self._active_batch_folder = None
+            self._set_batch_controls(False)
+            self.progress_label.config(text="Verarbeitung konnte nicht gestartet werden")
+            detail = str(error) or error.__class__.__name__
+            self.log_message(f"❌ Worker konnte nicht gestartet werden: {detail}")
+            messagebox.showerror(
+                "Verarbeitung nicht gestartet",
+                f"Hintergrundprozess konnte nicht gestartet werden:\n{detail}",
+            )
 
     def stop_processing(self):
         if not self.processing:
@@ -1031,6 +1153,41 @@ class PDFRenamerGUI:
         self.stop_button.config(state=tk.DISABLED)
         self.progress_label.config(text="Stoppen nach aktueller Datei …")
         self.log_message("⏹️ Verarbeitung wird zwischen Dateien gestoppt.")
+
+    def _set_batch_controls(self, running: bool):
+        self.start_button.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.stop_button.config(state=tk.NORMAL if running else tk.DISABLED)
+        self.folder_entry.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.browse_button.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.dry_run_check.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.month_combo.config(state=tk.DISABLED if running else "readonly")
+        self.year_entry.config(state=tk.DISABLED if running else tk.NORMAL)
+        for button in self.student_mutation_buttons:
+            button.config(state=tk.DISABLED if running else tk.NORMAL)
+
+    def _on_close(self):
+        if not self.processing:
+            self.root.destroy()
+            return
+        if self._close_requested:
+            return
+        if not messagebox.askyesno(
+            "Verarbeitung läuft",
+            "Nach der aktuellen Datei sicher stoppen und das Fenster schließen?",
+        ):
+            return
+        self._close_requested = True
+        self.stop_event.set()
+        self.stop_button.config(state=tk.DISABLED)
+        self.progress_label.config(text="Sicheres Beenden nach aktueller Datei …")
+        self.log_message("⏹️ Sicheres Beenden angefordert.")
+        self.root.after(50, self._finish_close)
+
+    def _finish_close(self):
+        if self.processing:
+            self.root.after(50, self._finish_close)
+            return
+        self.root.destroy()
 
     def _drain_worker_events(self):
         try:
@@ -1046,6 +1203,7 @@ class PDFRenamerGUI:
         kind = event.kind
         if kind == WorkerEventKind.STARTED:
             settings, total = event.payload
+            self._batch_queue_failed = False
             self.stats["total"] = total
             self.update_statistics()
             self.log_message("=" * 60)
@@ -1070,6 +1228,7 @@ class PDFRenamerGUI:
             count, path = event.payload
             self.log_message(f"📋 {count} Eintrag/Einträge gespeichert: {path}")
         elif kind == WorkerEventKind.QUEUE_ERROR:
+            self._batch_queue_failed = True
             self.log_message(f"❌ Warteschlangenfehler: {event.payload}")
         elif kind == WorkerEventKind.COMPLETED:
             if event.payload:
@@ -1078,17 +1237,33 @@ class PDFRenamerGUI:
             else:
                 self.progress_var.set(100)
                 self.progress_label.config(text="Verarbeitung abgeschlossen")
-                self.show_final_report()
-            self.load_review_queue(reload_store=True)
+                if not self._close_requested:
+                    self.show_final_report()
+                else:
+                    self.log_message("Abschlussbericht wegen Fenster-Schließen unterdrückt.")
+            if self._batch_queue_failed:
+                self.load_review_queue(reload_store=False)
+            else:
+                queue_path = (
+                    self._active_batch_folder / "manual_review.json"
+                    if self._active_batch_folder is not None
+                    else None
+                )
+                self.load_review_queue(
+                    reload_store=True,
+                    store_path_override=queue_path,
+                    allow_during_processing=True,
+                )
         elif kind == WorkerEventKind.FATAL:
             self.stats["error"] += 1
             self.update_statistics()
             self.log_message(f"❌ Schwerwiegender Fehler: {event.payload}")
-            messagebox.showerror("Fehler", f"Verarbeitung fehlgeschlagen:\n{event.payload}")
+            if not self._close_requested:
+                messagebox.showerror("Fehler", f"Verarbeitung fehlgeschlagen:\n{event.payload}")
         elif kind == WorkerEventKind.FINISHED:
             self.processing = False
-            self.start_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
+            self._active_batch_folder = None
+            self._set_batch_controls(False)
 
     def _present_processing_result(self, result):
         if result.error:

@@ -53,7 +53,7 @@ def test_apply_correction_move_and_rename(tmpdir):
     subject = "Mathematik"
     
     renamer = FileRenamer()
-    new_filename = renamer.generate_new_filename(surname, name, subject)
+    new_filename = renamer.generate_new_filename(surname, name, subject, 4, 2030)
     target_path = base_folder / new_filename
     
     print(f"  Новое имя файла: {new_filename}")
@@ -101,7 +101,9 @@ def test_apply_correction_with_collision(tmpdir):
     
     # Создаём файл с конфликтным именем в корне
     renamer = FileRenamer()
-    existing_filename = renamer.generate_new_filename("Schmidt", "Anna", "Physik")
+    existing_filename = renamer.generate_new_filename(
+        "Schmidt", "Anna", "Physik", 4, 2030
+    )
     existing_file = base_folder / existing_filename
     existing_file.write_text("Existing content")
     
@@ -179,7 +181,9 @@ def test_apply_to_all_batch_processing(tmpdir):
     
     for i, (surname, name) in enumerate(names, 1):
         source_path = files[i-1]
-        new_filename = renamer.generate_new_filename(surname, name, corrected_subject)
+        new_filename = renamer.generate_new_filename(
+            surname, name, corrected_subject, 4, 2030
+        )
         target_path = base_folder / new_filename
         
         shutil.move(str(source_path), str(target_path))
@@ -236,7 +240,9 @@ def test_apply_correction_statistics_update(tmpdir):
     
     # Применяем исправление
     renamer = FileRenamer()
-    new_filename = renamer.generate_new_filename("Test", "User", "Biologie")
+    new_filename = renamer.generate_new_filename(
+        "Test", "User", "Biologie", 4, 2030
+    )
     target_path = base_folder / new_filename
     
     shutil.move(str(file_path), str(target_path))

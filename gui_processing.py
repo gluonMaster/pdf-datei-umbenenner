@@ -25,11 +25,11 @@ class BatchSettings:
             or isinstance(self.month, bool)
             or not 1 <= self.month <= 12
         ):
-            raise ValueError("month must be between 1 and 12")
+            raise ValueError("Monat muss zwischen 1 und 12 liegen.")
         if not isinstance(self.year, int) or isinstance(self.year, bool) or self.year < 1:
-            raise ValueError("year must be positive")
+            raise ValueError("Jahr muss positiv sein.")
         if not isinstance(self.dry_run, bool):
-            raise ValueError("dry_run must be a boolean")
+            raise ValueError("Testmodus muss ein Wahrheitswert sein.")
 
 
 class WorkerEventKind(str, Enum):

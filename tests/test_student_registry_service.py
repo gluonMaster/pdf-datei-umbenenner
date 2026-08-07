@@ -135,7 +135,7 @@ def test_import_requires_confirmation_keeps_missing_and_updates_live_matcher(tmp
     )
     preview = admin.preview_import(source)
 
-    with pytest.raises(RegistryValidationError, match="explicitly confirmed"):
+    with pytest.raises(RegistryValidationError, match="ausdrücklich bestätigt"):
         admin.apply_import(preview)
 
     result = admin.apply_import(preview, confirmed=True)
@@ -158,7 +158,7 @@ def test_import_refuses_stale_preview(tmp_path):
     preview = admin.preview_import(source)
     admin.registry.add_student("Other", "Person")
 
-    with pytest.raises(RegistryValidationError, match="changed after the preview"):
+    with pytest.raises(RegistryValidationError, match="nach der Vorschau geändert"):
         admin.apply_import(preview, confirmed=True)
 
 

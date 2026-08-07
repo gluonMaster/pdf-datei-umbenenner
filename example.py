@@ -42,7 +42,15 @@ def example_single_file():
     # Генерация нового имени
     if result.is_valid() and name and subject:
         surname, first_name = name.split()
-        new_name = renamer.generate_new_filename(surname, first_name, subject)
+        selected_month = 4
+        selected_year = 2030
+        new_name = renamer.generate_new_filename(
+            surname,
+            first_name,
+            subject,
+            selected_month,
+            selected_year,
+        )
         print(f"\nНовое имя файла: {new_name}")
 
 

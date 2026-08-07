@@ -37,7 +37,7 @@ class TextParser:
         """Use a shared alias manager so newly confirmed aliases apply at once."""
 
         if not isinstance(manager, AliasManager):
-            raise TypeError("manager must be an AliasManager")
+            raise TypeError("manager muss ein AliasManager sein")
         cls._alias_manager = manager
     
     @classmethod

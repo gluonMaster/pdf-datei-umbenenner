@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import bootstrap
+import ocr
+from ocr import OCRAvailability
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,53 @@ def test_core_health_reports_invalid_configuration(tmp_path, capsys):
 
     assert bootstrap.check_core(tmp_path) == bootstrap.ExitCode.CONFIG_UNREADABLE
     assert "CONFIG_UNREADABLE" in capsys.readouterr().out
+
+
+def test_ocr_health_uses_structured_unavailability_reasons(monkeypatch, capsys):
+    class Provider:
+        def __init__(self, availability):
+            self.availability = availability
+
+        def check_availability(self):
+            return self.availability
+
+    monkeypatch.setattr(bootstrap, "_load_pymupdf", lambda: object())
+    cases = (
+        (
+            OCRAvailability(False, "Tesseract wurde nicht gefunden."),
+            bootstrap.ExitCode.TESSERACT_UNAVAILABLE,
+            "TESSERACT_UNAVAILABLE",
+        ),
+        (
+            OCRAvailability(
+                False,
+                "Tesseract-Sprachdaten fehlen: deu.",
+                Path("tesseract.exe"),
+                ("eng",),
+                ("deu",),
+            ),
+            bootstrap.ExitCode.OCR_LANGUAGE_DATA_UNAVAILABLE,
+            "OCR_LANGUAGE_DATA_UNAVAILABLE",
+        ),
+        (
+            OCRAvailability(
+                False,
+                "Tesseract konnte nicht abgefragt werden.",
+                Path("tesseract.exe"),
+            ),
+            bootstrap.ExitCode.OCR_CHECK_FAILED,
+            "OCR_CHECK_FAILED",
+        ),
+    )
+
+    for availability, expected_code, expected_category in cases:
+        monkeypatch.setattr(
+            ocr,
+            "TesseractOCRProvider",
+            lambda current=availability: Provider(current),
+        )
+        assert bootstrap.check_ocr() == expected_code
+        assert expected_category in capsys.readouterr().out
 
 
 def test_requirements_stamp_detects_changes(tmp_path):

@@ -32,6 +32,7 @@ class AliasManager:
         self.alias_file = alias_file
         self.create_if_missing = create_if_missing
         self.aliases: Dict[str, str] = {}
+        self.load_error: Optional[str] = None
         
         # Автоматически загрузить алиасы при создании
         self.load()
@@ -44,14 +45,14 @@ class AliasManager:
             True если загрузка прошла успешно, False в случае ошибки
         """
         self.aliases = {}
+        self.load_error = None
         
         if not self.alias_file.exists():
             if not self.create_if_missing:
                 return True
             # Обратная совместимость для явного использования менеджера.
             try:
-                self.save()
-                return True
+                return bool(self.save())
             except Exception as e:
                 print(f"Warnung: Alias-Datei konnte nicht erstellt werden: {e}")
                 return False
@@ -59,11 +60,28 @@ class AliasManager:
         try:
             with open(self.alias_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                self.aliases = data.get('aliases', {})
+            if not isinstance(data, dict):
+                raise TypeError("JSON-Wurzel muss ein Objekt sein")
+            if 'aliases' not in data:
+                raise TypeError("Pflichtfeld 'aliases' fehlt")
+            aliases = data['aliases']
+            if not isinstance(aliases, dict) or not all(
+                isinstance(source, str)
+                and source.strip()
+                and isinstance(target, str)
+                and target.strip()
+                for source, target in aliases.items()
+            ):
+                raise TypeError("'aliases' muss Textpaare enthalten")
+            self.aliases = aliases
             return True
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warnung: Fehler beim Laden von {self.alias_file.name}: {e}")
+        except (json.JSONDecodeError, OSError, UnicodeError, TypeError, ValueError) as e:
             self.aliases = {}
+            self.load_error = (
+                f"Alias-Datei '{self.alias_file.name}' ist beschädigt oder nicht lesbar: {e}. "
+                "Die Datei wird nicht überschrieben."
+            )
+            print(f"Fehler: {self.load_error}")
             return False
     
     def save(self) -> bool:
@@ -73,6 +91,10 @@ class AliasManager:
         Returns:
             True если сохранение прошло успешно, False в случае ошибки
         """
+        if self.load_error:
+            print(f"Fehler: {self.load_error}")
+            return False
+
         try:
             data = {
                 'aliases': self.aliases
@@ -99,6 +121,21 @@ class AliasManager:
         except (IOError, OSError) as e:
             print(f"Fehler beim Speichern von {self.alias_file.name}: {e}")
             return False
+
+    def add_and_save(self, incorrect: str, correct: str) -> bool:
+        """Persist one alias and restore the in-memory map if saving fails."""
+
+        previous = self.aliases.copy()
+        if not self.add_alias(incorrect, correct):
+            return False
+        try:
+            if self.save():
+                return True
+        except Exception:
+            self.aliases = previous
+            raise
+        self.aliases = previous
+        return False
     
     def add_alias(self, incorrect: str, correct: str) -> bool:
         """

@@ -131,12 +131,8 @@ def test_full_pipeline():
     print(f"Провалено: {failed}/{len(test_documents)}")
     print()
     
-    if failed == 0:
-        print("✅ ВСЕ ИНТЕГРАЦИОННЫЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!")
-        return True
-    else:
-        print(f"❌ ЕСТЬ ПРОВАЛЫ: {failed} тест(ов)")
-        return False
+    assert failed == 0, f"ЕСТЬ ПРОВАЛЫ: {failed} тест(ов)"
+    print("✅ ВСЕ ИНТЕГРАЦИОННЫЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!")
 
 
 def test_suggestions_accuracy():
@@ -177,30 +173,23 @@ def test_suggestions_accuracy():
     print(f"Точность: {correct}/{total} ({accuracy:.1f}%)")
     print()
     
-    if accuracy >= 80:
-        print("✅ ТОЧНОСТЬ ПОДСКАЗОК УДОВЛЕТВОРИТЕЛЬНА (≥80%)")
-        return True
-    else:
-        print(f"❌ ТОЧНОСТЬ ПОДСКАЗОК НЕДОСТАТОЧНА (<80%)")
-        return False
+    assert accuracy >= 80, f"Точность подсказок недостаточна: {accuracy:.1f}%"
+    print("✅ ТОЧНОСТЬ ПОДСКАЗОК УДОВЛЕТВОРИТЕЛЬНА (≥80%)")
 
 
 if __name__ == "__main__":
     print("\n" * 2)
     
     try:
-        test1_passed = test_full_pipeline()
-        test2_passed = test_suggestions_accuracy()
+        test_full_pipeline()
+        test_suggestions_accuracy()
         
         print("\n" + "=" * 70)
         print("ФИНАЛЬНЫЙ РЕЗУЛЬТАТ")
         print("=" * 70)
         
-        if test1_passed and test2_passed:
-            print("✅✅✅ ВСЕ ИНТЕГРАЦИОННЫЕ ТЕСТЫ ПРОЙДЕНЫ! ✅✅✅")
-            print("\nСистема готова к интеграции с GUI и CLI.")
-        else:
-            print("❌ ЕСТЬ ПРОБЛЕМЫ В ИНТЕГРАЦИОННЫХ ТЕСТАХ")
+        print("✅✅✅ ВСЕ ИНТЕГРАЦИОННЫЕ ТЕСТЫ ПРОЙДЕНЫ! ✅✅✅")
+        print("\nСистема готова к интеграции с GUI и CLI.")
             
     except Exception as e:
         print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
