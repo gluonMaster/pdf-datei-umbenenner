@@ -1,0 +1,117 @@
+"""Health helper and static launcher safety tests."""
+
+import json
+from pathlib import Path
+
+import bootstrap
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BAT_FILES = (
+    "setup.bat",
+    "start_app.bat",
+    "quick_start.bat",
+    "create_desktop_shortcut.bat",
+)
+
+
+def _write_health_data(root):
+    (root / "subjects_config.json").write_text(
+        json.dumps(
+            {
+                "subjects": ["Mathematik"],
+                "aliases": {"Mathe": "Mathematik"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "Schuler.csv").write_text(
+        "Nummer;Nachname;Forname\n1;Sample;Student\n",
+        encoding="utf-8",
+    )
+
+
+def test_python_minimum_has_a_stable_exit_code(capsys):
+    assert bootstrap.check_python_version((3, 9, 9)) == bootstrap.ExitCode.UNSUPPORTED_PYTHON
+    assert "Python 3.10 oder neuer" in capsys.readouterr().out
+    assert bootstrap.check_python_version((3, 10, 0), emit=False) == bootstrap.ExitCode.OK
+
+
+def test_core_health_reads_configuration_and_registry(tmp_path):
+    _write_health_data(tmp_path)
+
+    assert bootstrap.check_core(tmp_path) == bootstrap.ExitCode.OK
+
+
+def test_core_health_reports_invalid_configuration(tmp_path, capsys):
+    _write_health_data(tmp_path)
+    (tmp_path / "subjects_config.json").write_text("[]", encoding="utf-8")
+
+    assert bootstrap.check_core(tmp_path) == bootstrap.ExitCode.CONFIG_UNREADABLE
+    assert "CONFIG_UNREADABLE" in capsys.readouterr().out
+
+
+def test_requirements_stamp_detects_changes(tmp_path):
+    (tmp_path / "requirements.txt").write_text("example>=1\n", encoding="ascii")
+
+    assert (
+        bootstrap.requirements_current(tmp_path)
+        == bootstrap.ExitCode.REQUIREMENTS_CHANGED
+    )
+    assert bootstrap.write_requirements_stamp(tmp_path) == bootstrap.ExitCode.OK
+    assert bootstrap.requirements_current(tmp_path) == bootstrap.ExitCode.OK
+
+    (tmp_path / "requirements.txt").write_text("example>=2\n", encoding="ascii")
+    assert (
+        bootstrap.requirements_current(tmp_path)
+        == bootstrap.ExitCode.REQUIREMENTS_CHANGED
+    )
+
+
+def test_missing_requirements_is_a_bootstrap_error(tmp_path, capsys):
+    assert bootstrap.requirements_current(tmp_path) == bootstrap.ExitCode.BOOTSTRAP_ERROR
+    assert "requirements.txt fehlt" in capsys.readouterr().out
+
+
+def test_batch_files_are_ascii_and_use_the_local_environment():
+    for name in BAT_FILES:
+        raw = (PROJECT_ROOT / name).read_bytes()
+        assert all(byte < 128 for byte in raw), name
+        text = raw.decode("ascii").casefold()
+        if name != "create_desktop_shortcut.bat":
+            assert 'cd /d "%project_dir%"' in text
+
+    setup = (PROJECT_ROOT / "setup.bat").read_text(encoding="ascii").casefold()
+    smart = (PROJECT_ROOT / "start_app.bat").read_text(encoding="ascii").casefold()
+    shortcut = (PROJECT_ROOT / "create_desktop_shortcut.bat").read_text(
+        encoding="ascii"
+    ).casefold()
+
+    assert '"%venv_python%" -m pip install' in setup
+    assert '"%venv_python%" -m pip install' in smart
+    assert "requirements-current" in smart
+    assert "--health-only" in smart
+    assert smart.index("requirements-current") < smart.index(":repair_environment")
+    assert "%~dp0start_app.bat" in shortcut
+
+
+def test_quick_start_never_installs_or_repairs_packages():
+    quick = (PROJECT_ROOT / "quick_start.bat").read_text(encoding="ascii").casefold()
+
+    assert " pip " not in quick
+    assert "requirements" not in quick
+    assert "setup.bat" not in quick
+    assert '"%venv_python%" "%project_dir%start_gui.py"' in quick
+
+
+def test_dependency_groups_are_separate():
+    core = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    ocr = (PROJECT_ROOT / "requirements-ocr.txt").read_text(encoding="utf-8")
+    dev = (PROJECT_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+
+    assert "pdfplumber" in core
+    assert "PyInstaller" not in core
+    assert "six>=" not in core
+    assert "PyMuPDF" not in core
+    assert "PyMuPDF" in ocr
+    assert "pytest" in dev

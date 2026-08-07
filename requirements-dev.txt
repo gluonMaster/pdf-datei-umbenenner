@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Direct test dependencies.
+Pillow>=8.0
+pytest>=7.0

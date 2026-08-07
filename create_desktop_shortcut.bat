@@ -1,60 +1,25 @@
 @echo off
-title PDF Datei Umbenenner - Desktop Verknüpfung erstellen
+setlocal EnableExtensions DisableDelayedExpansion
+title PDF Datei Umbenenner - Desktop Shortcut
 
-echo.
-echo ================================================================
-echo   PDF Datei Umbenenner - Desktop Verknüpfung
-echo ================================================================
-echo.
+set "PROJECT_DIR=%~dp0"
+set "PDF_RENAMER_SHORTCUT_TARGET=%~dp0start_app.bat"
+set "PDF_RENAMER_SHORTCUT_WORKDIR=%~dp0"
 
-REM Aktueller Pfad
-set "CURRENT_DIR=%~dp0"
-
-REM Desktop-Pfad ermitteln
-set "DESKTOP=%USERPROFILE%\Desktop"
-
-echo Erstelle Desktop-Verknüpfung...
-echo.
-echo Aktueller Ordner: %CURRENT_DIR%
-echo Desktop: %DESKTOP%
-echo.
-
-REM VBScript zur Erstellung der Verknüpfung
-set "VBS_FILE=%TEMP%\create_shortcut.vbs"
-
-echo Set oWS = WScript.CreateObject("WScript.Shell") > "%VBS_FILE%"
-echo sLinkFile = "%DESKTOP%\PDF Datei Umbenenner.lnk" >> "%VBS_FILE%"
-echo Set oLink = oWS.CreateShortcut(sLinkFile) >> "%VBS_FILE%"
-echo oLink.TargetPath = "%CURRENT_DIR%start_app.bat" >> "%VBS_FILE%"
-echo oLink.WorkingDirectory = "%CURRENT_DIR%" >> "%VBS_FILE%"
-echo oLink.Description = "PDF Datei Umbenenner - Automatisches Umbenennen von PDF-Formularen" >> "%VBS_FILE%"
-echo oLink.IconLocation = "%%SystemRoot%%\System32\shell32.dll,70" >> "%VBS_FILE%"
-echo oLink.Save >> "%VBS_FILE%"
-
-REM VBScript ausführen
-cscript //nologo "%VBS_FILE%"
-
-REM Temporäre Datei löschen
-del "%VBS_FILE%"
-
-if exist "%DESKTOP%\PDF Datei Umbenenner.lnk" (
-    echo ✅ Desktop-Verknüpfung erfolgreich erstellt!
-    echo.
-    echo Die Verknüpfung "PDF Datei Umbenenner" wurde auf Ihrem Desktop erstellt.
-    echo Sie können jetzt die Anwendung direkt vom Desktop starten.
-) else (
-    echo ❌ Fehler beim Erstellen der Verknüpfung!
-    echo.
-    echo Mögliche Ursachen:
-    echo 1. Keine Berechtigung zum Schreiben auf den Desktop
-    echo 2. Antivirus-Software blockiert die Erstellung
-    echo.
-    echo Versuchen Sie:
-    echo 1. Diese Batch-Datei als Administrator auszuführen
-    echo 2. Antivirus-Software temporär zu deaktivieren
-    echo 3. Manuell eine Verknüpfung zu erstellen
+if not exist "%PDF_RENAMER_SHORTCUT_TARGET%" (
+    echo FEHLER: start_app.bat wurde in "%PROJECT_DIR%" nicht gefunden.
+    exit /b 2
 )
 
-echo.
-echo Drücken Sie eine beliebige Taste zum Beenden...
-pause >nul
+echo Desktop-Verknuepfung fuer start_app.bat wird erstellt...
+powershell.exe -NoProfile -NonInteractive -Command "$ErrorActionPreference = 'Stop'; $shell = New-Object -ComObject WScript.Shell; $desktop = [Environment]::GetFolderPath('DesktopDirectory'); if ([string]::IsNullOrWhiteSpace($desktop)) { throw 'Desktop directory was not found.' }; $shortcut = $shell.CreateShortcut((Join-Path $desktop 'PDF Datei Umbenenner.lnk')); $shortcut.TargetPath = $env:PDF_RENAMER_SHORTCUT_TARGET; $shortcut.WorkingDirectory = $env:PDF_RENAMER_SHORTCUT_WORKDIR; $shortcut.Description = 'PDF Datei Umbenenner'; $shortcut.IconLocation = (Join-Path $env:SystemRoot 'System32\shell32.dll') + ',70'; $shortcut.Save()"
+if errorlevel 1 goto shortcut_failed
+
+echo OK: Desktop-Verknuepfung fuer "%PDF_RENAMER_SHORTCUT_TARGET%" erstellt.
+exit /b 0
+
+:shortcut_failed
+set "SHORTCUT_EXIT=%ERRORLEVEL%"
+echo FEHLER: Die Desktop-Verknuepfung konnte nicht erstellt werden.
+echo Pruefen Sie die Schreibberechtigung fuer den Desktop-Ordner.
+exit /b %SHORTCUT_EXIT%

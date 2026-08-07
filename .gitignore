@@ -40,3 +40,6 @@ Desktop.ini
 *.bak
 *.old
 ~$*
+.launcher-logs/
+.bootstrap/
+bootstrap-*.tmp

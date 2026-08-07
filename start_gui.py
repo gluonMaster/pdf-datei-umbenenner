@@ -1,17 +1,19 @@
-"""
-Einfacher Starter für die GUI-Version des PDF Umbeneners
-"""
+"""Small, launcher-friendly entry point for the GUI application."""
 
 import sys
 from pathlib import Path
 
-# Füge das aktuelle Verzeichnis zum Python-Pfad hinzu
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
-try:
+
+def run():
+    """Import lazily so launcher health-check failures remain diagnosable."""
+
     from gui_main import main
-    main()
-except Exception as e:
-    print(f"Fehler beim Starten der GUI: {e}")
-    input("Drücken Sie Enter zum Beenden...")
+
+    return main()
+
+
+if __name__ == "__main__":
+    run()

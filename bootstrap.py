@@ -1,0 +1,334 @@
+"""Environment health checks shared by the Windows launchers.
+
+The file intentionally uses syntax supported by older Python versions so it can
+print a useful error before the application (which requires Python 3.10) is
+imported.  It never installs packages or changes system configuration.
+"""
+
+import argparse
+import hashlib
+import importlib
+import json
+from enum import IntEnum
+from pathlib import Path
+import sys
+
+
+MINIMUM_PYTHON = (3, 10)
+PROJECT_ROOT = Path(__file__).resolve().parent
+CORE_DEPENDENCIES = ("pdfplumber",)
+CORE_APPLICATION_MODULES = (
+    "pdf_extractor",
+    "form_parser",
+    "processing_service",
+    "student_registry_service",
+    "gui_main",
+)
+DEFAULT_REQUIREMENTS = "requirements.txt"
+DEFAULT_STAMP = ".venv/.requirements.sha256"
+
+
+class ExitCode(IntEnum):
+    """Stable process exit codes consumed by the BAT launchers."""
+
+    OK = 0
+    UNSUPPORTED_PYTHON = 10
+    CORE_DEPENDENCY_UNAVAILABLE = 20
+    TKINTER_UNAVAILABLE = 21
+    APPLICATION_IMPORT_FAILED = 22
+    CONFIG_UNREADABLE = 23
+    REGISTRY_UNREADABLE = 24
+    OCR_PYTHON_DEPENDENCY_UNAVAILABLE = 30
+    TESSERACT_UNAVAILABLE = 31
+    OCR_LANGUAGE_DATA_UNAVAILABLE = 32
+    OCR_CHECK_FAILED = 33
+    REQUIREMENTS_CHANGED = 40
+    BOOTSTRAP_ERROR = 50
+
+
+def _version_text(version_info=None):
+    version = version_info or sys.version_info
+    return ".".join(str(part) for part in version[:3])
+
+
+def check_python_version(version_info=None, emit=True):
+    """Check the application minimum without importing application modules."""
+
+    version = version_info or sys.version_info
+    if tuple(version[:2]) < MINIMUM_PYTHON:
+        if emit:
+            print(
+                "PYTHON_UNSUPPORTED: Python 3.10 oder neuer ist erforderlich; gefunden: "
+                + _version_text(version)
+                + "."
+            )
+        return ExitCode.UNSUPPORTED_PYTHON
+    if emit:
+        print("PYTHON_OK: Python " + _version_text(version) + " wird unterstuetzt.")
+    return ExitCode.OK
+
+
+def _import_modules(module_names, failure_code, category):
+    for module_name in module_names:
+        try:
+            importlib.import_module(module_name)
+        except Exception as error:
+            detail = str(error).strip() or error.__class__.__name__
+            print(
+                category
+                + ": Import fehlgeschlagen: "
+                + module_name
+                + " ("
+                + detail
+                + ")."
+            )
+            return failure_code
+    return ExitCode.OK
+
+
+def _check_subjects_config(project_root):
+    config_path = project_root / "subjects_config.json"
+    try:
+        with config_path.open("r", encoding="utf-8-sig") as config_file:
+            config = json.load(config_file)
+        if not isinstance(config, dict):
+            raise ValueError("the root value must be an object")
+        subjects = config.get("subjects")
+        aliases = config.get("aliases")
+        if not isinstance(subjects, list) or not subjects:
+            raise ValueError("subjects must be a non-empty list")
+        if not all(isinstance(item, str) and item.strip() for item in subjects):
+            raise ValueError("every subject must be non-empty text")
+        if not isinstance(aliases, dict):
+            raise ValueError("aliases must be an object")
+        if not all(
+            isinstance(alias, str)
+            and alias.strip()
+            and isinstance(subject, str)
+            and subject.strip()
+            for alias, subject in aliases.items()
+        ):
+            raise ValueError("every alias and target must be non-empty text")
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        detail = str(error).strip() or error.__class__.__name__
+        print("CONFIG_UNREADABLE: Konfiguration unlesbar: " + str(config_path) + " (" + detail + ").")
+        return ExitCode.CONFIG_UNREADABLE
+    return ExitCode.OK
+
+
+def _check_student_registry(project_root):
+    registry_path = project_root / "Schuler.csv"
+    aliases_path = project_root / "student_aliases.json"
+    try:
+        from student_registry import StudentRegistry
+
+        registry = StudentRegistry(registry_path, aliases_path)
+        if not registry.is_available:
+            raise ValueError(registry.load_error or "unknown registry error")
+        if not registry.students:
+            raise ValueError("the registry contains no students")
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        print("REGISTRY_UNREADABLE: Schuelerverzeichnis unlesbar: " + str(registry_path) + " (" + detail + ").")
+        return ExitCode.REGISTRY_UNREADABLE
+    return ExitCode.OK
+
+
+def check_core(project_root=PROJECT_ROOT):
+    """Validate everything required to start the application without OCR."""
+
+    project_root = Path(project_root).resolve()
+    code = check_python_version()
+    if code != ExitCode.OK:
+        return code
+
+    code = _import_modules(
+        CORE_DEPENDENCIES,
+        ExitCode.CORE_DEPENDENCY_UNAVAILABLE,
+        "CORE_DEPENDENCY_UNAVAILABLE",
+    )
+    if code != ExitCode.OK:
+        return code
+
+    code = _import_modules(
+        ("tkinter",),
+        ExitCode.TKINTER_UNAVAILABLE,
+        "TKINTER_UNAVAILABLE",
+    )
+    if code != ExitCode.OK:
+        return code
+
+    code = _import_modules(
+        CORE_APPLICATION_MODULES,
+        ExitCode.APPLICATION_IMPORT_FAILED,
+        "APPLICATION_IMPORT_FAILED",
+    )
+    if code != ExitCode.OK:
+        return code
+
+    code = _check_subjects_config(project_root)
+    if code != ExitCode.OK:
+        return code
+
+    code = _check_student_registry(project_root)
+    if code != ExitCode.OK:
+        return code
+
+    print("CORE_OK: Importe, tkinter, Konfiguration und Schuelerverzeichnis sind bereit.")
+    return ExitCode.OK
+
+
+def _load_pymupdf():
+    errors = []
+    for module_name in ("pymupdf", "fitz"):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as error:
+            errors.append(str(error))
+    raise ImportError("; ".join(errors) or "PyMuPDF is not installed")
+
+
+def check_ocr(project_root=PROJECT_ROOT):
+    """Check optional Python rendering, Tesseract, and deu/eng language data."""
+
+    del project_root  # Kept in the public signature for symmetry and tests.
+    code = check_python_version(emit=False)
+    if code != ExitCode.OK:
+        check_python_version()
+        return code
+
+    try:
+        _load_pymupdf()
+    except ImportError as error:
+        detail = str(error).strip() or error.__class__.__name__
+        print(
+            "OCR_PYTHON_DEPENDENCY_UNAVAILABLE: requirements-ocr.txt installieren ("
+            + detail
+            + ")."
+        )
+        return ExitCode.OCR_PYTHON_DEPENDENCY_UNAVAILABLE
+
+    try:
+        from ocr import TesseractOCRProvider
+
+        availability = TesseractOCRProvider().check_availability()
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        print("OCR_CHECK_FAILED: OCR-Pruefung fehlgeschlagen (" + detail + ").")
+        return ExitCode.OCR_CHECK_FAILED
+
+    if availability.available:
+        print("OCR_OK: Tesseract und die konfigurierten Sprachdaten sind bereit.")
+        return ExitCode.OK
+
+    message = availability.message
+    lowered = message.casefold()
+    if "executable was not found" in lowered:
+        code = ExitCode.TESSERACT_UNAVAILABLE
+        category = "TESSERACT_UNAVAILABLE"
+    elif "missing tesseract language data" in lowered:
+        code = ExitCode.OCR_LANGUAGE_DATA_UNAVAILABLE
+        category = "OCR_LANGUAGE_DATA_UNAVAILABLE"
+    else:
+        code = ExitCode.OCR_CHECK_FAILED
+        category = "OCR_CHECK_FAILED"
+    print(category + ": OCR ist nicht verfuegbar. " + message)
+    return code
+
+
+def requirements_digest(project_root=PROJECT_ROOT):
+    """Return a deterministic digest of the mandatory requirements input."""
+
+    requirements_path = Path(project_root).resolve() / DEFAULT_REQUIREMENTS
+    digest = hashlib.sha256()
+    digest.update(DEFAULT_REQUIREMENTS.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(requirements_path.read_bytes())
+    return digest.hexdigest()
+
+
+def requirements_current(project_root=PROJECT_ROOT):
+    project_root = Path(project_root).resolve()
+    stamp_path = project_root / DEFAULT_STAMP
+    try:
+        expected = requirements_digest(project_root)
+    except FileNotFoundError:
+        print("BOOTSTRAP_ERROR: requirements.txt fehlt.")
+        return ExitCode.BOOTSTRAP_ERROR
+    except OSError as error:
+        print("BOOTSTRAP_ERROR: requirements.txt kann nicht gelesen werden (" + str(error) + ").")
+        return ExitCode.BOOTSTRAP_ERROR
+
+    try:
+        actual = stamp_path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        print("REQUIREMENTS_CHANGED: Der Requirements-Stempel fehlt.")
+        return ExitCode.REQUIREMENTS_CHANGED
+    except (OSError, UnicodeError) as error:
+        print("BOOTSTRAP_ERROR: Requirements-Stand ist unlesbar (" + str(error) + ").")
+        return ExitCode.BOOTSTRAP_ERROR
+
+    if actual != expected:
+        print("REQUIREMENTS_CHANGED: requirements.txt wurde seit der Installation geaendert.")
+        return ExitCode.REQUIREMENTS_CHANGED
+    print("REQUIREMENTS_OK: Installierte Kernabhaengigkeiten sind aktuell.")
+    return ExitCode.OK
+
+
+def write_requirements_stamp(project_root=PROJECT_ROOT):
+    project_root = Path(project_root).resolve()
+    stamp_path = project_root / DEFAULT_STAMP
+    temporary_path = stamp_path.with_suffix(stamp_path.suffix + ".tmp")
+    try:
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            requirements_digest(project_root) + "\n", encoding="ascii"
+        )
+        temporary_path.replace(stamp_path)
+    except (OSError, UnicodeError) as error:
+        print("BOOTSTRAP_ERROR: Requirements-Stand kann nicht gespeichert werden (" + str(error) + ").")
+        return ExitCode.BOOTSTRAP_ERROR
+    print("REQUIREMENTS_STAMP_WRITTEN: " + str(stamp_path) + ".")
+    return ExitCode.OK
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=PROJECT_ROOT,
+        help="Project directory containing configuration and requirements files.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="check-core",
+        choices=(
+            "check-python",
+            "check-core",
+            "check-ocr",
+            "requirements-current",
+            "write-requirements-stamp",
+        ),
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_argument_parser().parse_args(argv)
+    if args.command == "check-python":
+        code = check_python_version()
+    elif args.command == "check-core":
+        code = check_core(args.project_root)
+    elif args.command == "check-ocr":
+        code = check_ocr(args.project_root)
+    elif args.command == "requirements-current":
+        code = requirements_current(args.project_root)
+    else:
+        code = write_requirements_stamp(args.project_root)
+    return int(code)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

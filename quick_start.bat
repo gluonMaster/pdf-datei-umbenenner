@@ -1,52 +1,27 @@
 @echo off
+setlocal EnableExtensions DisableDelayedExpansion
 title PDF Datei Umbenenner - Quick Start
 
-echo.
-echo ================================================================
-echo   PDF Datei Umbenenner - Quick Start
-echo ================================================================
-echo.
+set "PROJECT_DIR=%~dp0"
+set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
 
-REM Wechsle in das Verzeichnis der Batch-Datei
-cd /d "%~dp0"
-
-REM Schnelle Python-Prüfung
-python --version >nul 2>&1
+cd /d "%PROJECT_DIR%"
 if errorlevel 1 (
-    echo ❌ Python nicht gefunden! Verwenden Sie start_app.bat für eine vollständige Prüfung.
-    pause
-    exit /b 1
+    echo FEHLER: Das Anwendungsverzeichnis kann nicht geoeffnet werden.
+    exit /b 50
 )
 
-echo ✅ Python gefunden
-echo 🚀 Starte PDF Datei Umbenenner...
-echo.
-
-REM Versuche GUI zu starten (in Reihenfolge der Priorität)
-if exist "start_gui.py" (
-    python start_gui.py
-) else if exist "gui_main.py" (
-    python gui_main.py
-) else if exist "gui_minimal.py" (
-    python gui_minimal.py
-) else if exist "main.py" (
-    python main.py --gui
-) else (
-    echo ❌ Keine GUI-Datei gefunden!
-    echo    Verwenden Sie start_app.bat für eine vollständige Diagnose.
-    pause
-    exit /b 1
+if not exist "%VENV_PYTHON%" (
+    echo FEHLER: Das vorbereitete lokale .venv wurde nicht gefunden.
+    echo start_app.bat erstellt oder repariert die Umgebung.
+    exit /b 2
 )
 
-if errorlevel 1 (
-    echo.
-    echo ❌ Fehler beim Starten!
-    echo    Mögliche Ursachen: Fehlende Abhängigkeiten
-    echo    Lösung: Verwenden Sie start_app.bat für automatische Installation
-    echo.
-    pause
+if not exist "%PROJECT_DIR%start_gui.py" (
+    echo FEHLER: start_gui.py wurde nicht gefunden.
+    echo Fuer eine vollstaendige Diagnose start_app.bat ausfuehren.
+    exit /b 50
 )
 
-echo.
-echo Anwendung beendet.
-timeout /t 2 /nobreak >nul
+"%VENV_PYTHON%" "%PROJECT_DIR%start_gui.py"
+exit /b %ERRORLEVEL%
