@@ -18,6 +18,7 @@ from processing_service import (
 )
 from review_queue import ReviewStore
 from student_registry import StudentRegistry
+from student_registry_service import StudentRegistryPaths
 from validator import Validator
 
 
@@ -43,12 +44,16 @@ class PDFRenamerApp:
 
         if service is None:
             project_folder = Path(__file__).parent
+            registry_paths = StudentRegistryPaths.in_directory(project_folder)
             review_store = ReviewStore(self.input_folder / "manual_review.json")
             review_store.load()
             service = DocumentProcessingService(
                 extractor=PDFExtractor(),
                 parser=FormParser(),
-                student_registry=StudentRegistry(project_folder / "Schuler.csv"),
+                student_registry=StudentRegistry(
+                    registry_paths.csv_path,
+                    registry_paths.aliases_path,
+                ),
                 validator=Validator(),
                 review_store=review_store,
                 renamer=FileRenamer(),

@@ -26,7 +26,7 @@ from review_actions import (
     ReviewDecision,
 )
 from review_queue import ReviewStore
-from student_registry import StudentRegistry
+from student_registry_service import ImportPreview, StudentRegistryService
 from text_parser import TextParser
 from validator import Validator
 
@@ -61,7 +61,8 @@ class PDFRenamerGUI:
         self.validator = Validator()
         self.renamer = FileRenamer()
         self.review_store = ReviewStore()
-        self.student_registry = StudentRegistry(project_folder / "Schuler.csv")
+        self.student_admin = StudentRegistryService.from_directory(project_folder)
+        self.student_registry = self.student_admin.registry
         self.processing_service = DocumentProcessingService(
             extractor=self.extractor,
             parser=self.parser,
@@ -114,6 +115,7 @@ class PDFRenamerGUI:
         self.notebook.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.setup_processing_tab()
         self.setup_review_tab()
+        self.setup_students_tab()
 
     def setup_processing_tab(self):
         frame = ttk.Frame(self.notebook, padding="10")
@@ -314,6 +316,394 @@ class PDFRenamerGUI:
         self.preview_text.config(yscrollcommand=preview_scroll.set)
         preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.preview_text.pack(fill=tk.BOTH, expand=True)
+
+    def setup_students_tab(self):
+        frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(frame, text="Schüler")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        filters = ttk.LabelFrame(frame, text="Suche und Filter", padding="8")
+        filters.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
+        filters.columnconfigure(1, weight=1)
+        self.student_search = tk.StringVar()
+        self.student_active_filter = tk.StringVar(value="Alle")
+        ttk.Label(filters, text="Suche:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(filters, textvariable=self.student_search).grid(
+            row=0, column=1, sticky=(tk.W, tk.E), padx=(8, 16)
+        )
+        ttk.Label(filters, text="Status:").grid(row=0, column=2, sticky=tk.W)
+        active_combo = ttk.Combobox(
+            filters,
+            textvariable=self.student_active_filter,
+            values=("Alle", "Aktiv", "Inaktiv"),
+            state="readonly",
+            width=12,
+        )
+        active_combo.grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        active_combo.bind("<<ComboboxSelected>>", self.load_students_table)
+        self.student_search.trace_add("write", lambda *_: self.load_students_table())
+
+        table = ttk.Frame(frame)
+        table.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        scroll_y = ttk.Scrollbar(table, orient=tk.VERTICAL)
+        self.student_tree = ttk.Treeview(
+            table,
+            columns=("number", "last_name", "first_name", "active"),
+            show="headings",
+            yscrollcommand=scroll_y.set,
+            selectmode="browse",
+        )
+        scroll_y.config(command=self.student_tree.yview)
+        for key, title, width, anchor in (
+            ("number", "Nummer", 90, tk.E),
+            ("last_name", "Nachname", 260, tk.W),
+            ("first_name", "Vorname", 260, tk.W),
+            ("active", "Status", 120, tk.CENTER),
+        ):
+            self.student_tree.heading(key, text=title)
+            self.student_tree.column(key, width=width, minwidth=70, anchor=anchor)
+        self.student_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scroll_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.student_tree.bind("<Double-Button-1>", lambda _event: self.edit_student())
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(8, 4))
+        for text, command in (
+            ("Neu", self.add_student),
+            ("Bearbeiten", self.edit_student),
+            ("Aktivieren / Deaktivieren", self.toggle_student_active),
+            ("Aliase", self.show_student_aliases),
+            ("Duplikate suchen", self.show_student_duplicates),
+            ("CSV importieren…", self.import_students_csv),
+            ("Aktualisieren", self.load_students_table),
+        ):
+            ttk.Button(buttons, text=text, command=command).pack(
+                side=tk.LEFT, padx=(0, 6)
+            )
+
+        self.student_registry_status = ttk.Label(frame, text="")
+        self.student_registry_status.grid(row=3, column=0, sticky=tk.W)
+        self.load_students_table()
+
+    def _student_filter_value(self):
+        return {"Aktiv": True, "Inaktiv": False}.get(self.student_active_filter.get())
+
+    def load_students_table(self, _event=None):
+        if not hasattr(self, "student_tree"):
+            return
+        selected = self.student_tree.selection()
+        selected_number = selected[0] if selected else None
+        self.student_tree.delete(*self.student_tree.get_children())
+        students = self.student_admin.search(
+            self.student_search.get(), self._student_filter_value()
+        )
+        for student in students:
+            self.student_tree.insert(
+                "",
+                tk.END,
+                iid=str(student.number),
+                values=(
+                    student.number,
+                    student.last_name,
+                    student.first_name,
+                    "Aktiv" if student.active else "Inaktiv",
+                ),
+            )
+        if selected_number and self.student_tree.exists(selected_number):
+            self.student_tree.selection_set(selected_number)
+        diagnostic = self.student_registry.load_error
+        status = diagnostic or (
+            f"{len(students)} von {len(self.student_registry.students)} Einträgen | "
+            f"Datei: {self.student_admin.paths.csv_path}"
+        )
+        self.student_registry_status.config(text=status)
+
+    def _selected_student_number(self):
+        selected = self.student_tree.selection()
+        if not selected:
+            messagebox.showwarning("Schüler", "Bitte wählen Sie einen Schüler aus.")
+            return None
+        return int(selected[0])
+
+    def _show_student_editor(self, title, student=None):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        last_name = tk.StringVar(value=student.last_name if student else "")
+        first_name = tk.StringVar(value=student.first_name if student else "")
+        active = tk.BooleanVar(value=student.active if student else True)
+        result = []
+        body = ttk.Frame(dialog, padding="12")
+        body.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Nachname:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        last_entry = ttk.Entry(body, textvariable=last_name, width=34)
+        last_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(8, 0), pady=4)
+        ttk.Label(body, text="Vorname:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(body, textvariable=first_name).grid(
+            row=1, column=1, sticky=(tk.W, tk.E), padx=(8, 0), pady=4
+        )
+        ttk.Checkbutton(body, text="Aktiv", variable=active).grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 10)
+        )
+
+        def accept():
+            if not last_name.get().strip() or not first_name.get().strip():
+                messagebox.showwarning(
+                    title, "Nachname und Vorname sind erforderlich.", parent=dialog
+                )
+                return
+            result.append((last_name.get(), first_name.get(), active.get()))
+            dialog.destroy()
+
+        actions = ttk.Frame(body)
+        actions.grid(row=3, column=0, columnspan=2, sticky=tk.E)
+        ttk.Button(actions, text="Abbrechen", command=dialog.destroy).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(actions, text="Speichern", command=accept).pack(side=tk.RIGHT)
+        dialog.bind("<Return>", lambda _event: accept())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        last_entry.focus_set()
+        self.root.wait_window(dialog)
+        return result[0] if result else None
+
+    def add_student(self):
+        values = self._show_student_editor("Neuen Schüler anlegen")
+        if values is None:
+            return
+        try:
+            student = self.student_registry.add_student(
+                values[0], values[1], active=values[2]
+            )
+        except Exception as error:
+            messagebox.showerror("Schüler konnte nicht gespeichert werden", str(error))
+            return
+        self._after_student_change(student.number)
+
+    def edit_student(self):
+        number = self._selected_student_number()
+        if number is None:
+            return
+        student = self.student_registry.select_existing(number)
+        values = self._show_student_editor("Schüler bearbeiten", student)
+        if values is None:
+            return
+        try:
+            self.student_registry.update_student(
+                number,
+                last_name=values[0],
+                first_name=values[1],
+                active=values[2],
+            )
+        except Exception as error:
+            messagebox.showerror("Schüler konnte nicht gespeichert werden", str(error))
+            return
+        self._after_student_change(number)
+
+    def toggle_student_active(self):
+        number = self._selected_student_number()
+        if number is None:
+            return
+        student = self.student_registry.select_existing(number)
+        action = "aktivieren" if not student.active else "deaktivieren"
+        if not messagebox.askyesno(
+            "Status ändern", f"{student.full_name} wirklich {action}?"
+        ):
+            return
+        try:
+            self.student_registry.update_student(number, active=not student.active)
+        except Exception as error:
+            messagebox.showerror("Status konnte nicht geändert werden", str(error))
+            return
+        self._after_student_change(number)
+
+    def _after_student_change(self, selected_number=None):
+        self.load_students_table()
+        if selected_number is not None and self.student_tree.exists(str(selected_number)):
+            self.student_tree.selection_set(str(selected_number))
+            self.student_tree.see(str(selected_number))
+        current = getattr(self, "current_review_item", None)
+        if current is not None:
+            self._update_student_choices(current)
+
+    def show_student_aliases(self):
+        number = self._selected_student_number()
+        if number is None:
+            return
+        student = self.student_registry.select_existing(number)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Aliase – {student.full_name}")
+        dialog.transient(self.root)
+        dialog.geometry("560x320")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        alias_tree = ttk.Treeview(dialog, columns=("alias",), show="headings")
+        alias_tree.heading("alias", text="Bestätigter Alias")
+        alias_tree.column("alias", width=500)
+        alias_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
+
+        def refresh_aliases():
+            alias_tree.delete(*alias_tree.get_children())
+            for position, alias in enumerate(self.student_admin.aliases_for(number)):
+                alias_tree.insert("", tk.END, iid=str(position), values=(alias.name,))
+
+        def remove_selected():
+            selected = alias_tree.selection()
+            if not selected:
+                messagebox.showwarning("Alias", "Bitte wählen Sie einen Alias aus.", parent=dialog)
+                return
+            alias_name = alias_tree.item(selected[0], "values")[0]
+            if not messagebox.askyesno(
+                "Alias löschen",
+                f"Fehlerhaften Alias „{alias_name}“ wirklich löschen?",
+                parent=dialog,
+            ):
+                return
+            try:
+                self.student_admin.remove_alias(alias_name)
+            except Exception as error:
+                messagebox.showerror("Alias konnte nicht gelöscht werden", str(error), parent=dialog)
+                return
+            refresh_aliases()
+
+        actions = ttk.Frame(dialog)
+        actions.grid(row=1, column=0, sticky=tk.E, padx=10, pady=(0, 10))
+        ttk.Button(actions, text="Alias löschen", command=remove_selected).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Schließen", command=dialog.destroy).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        refresh_aliases()
+
+    def show_student_duplicates(self):
+        duplicates = self.student_admin.find_potential_duplicates()
+        if not duplicates:
+            messagebox.showinfo("Duplikate", "Keine potenziellen Duplikate gefunden.")
+            return
+        lines = [
+            f"{item.first.number}: {item.first.full_name}  ↔  "
+            f"{item.second.number}: {item.second.full_name}  "
+            f"({item.score:.0%}, {item.reason})"
+            for item in duplicates
+        ]
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Potenzielle Duplikate")
+        dialog.transient(self.root)
+        text = scrolledtext.ScrolledText(dialog, width=90, height=24, wrap=tk.WORD)
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert("1.0", "\n".join(lines))
+        text.config(state=tk.DISABLED)
+        ttk.Button(dialog, text="Schließen", command=dialog.destroy).pack(pady=(0, 10))
+
+    def import_students_csv(self):
+        source = filedialog.askopenfilename(
+            title="Neue Schülerliste auswählen",
+            filetypes=(("CSV-Dateien", "*.csv"), ("Alle Dateien", "*.*")),
+        )
+        if not source:
+            return
+        try:
+            preview = self.student_admin.preview_import(source)
+        except Exception as error:
+            messagebox.showerror("CSV konnte nicht geprüft werden", str(error))
+            return
+        self._show_import_preview(preview)
+
+    def _show_import_preview(self, preview: ImportPreview):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Importvorschau – keine Änderungen vorgenommen")
+        dialog.transient(self.root)
+        dialog.geometry("1000x600")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        ttk.Label(dialog, text=preview.summary, font=("Arial", 10, "bold")).grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=10
+        )
+        table = ttk.Frame(dialog)
+        table.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10)
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        scroll = ttk.Scrollbar(table, orient=tk.VERTICAL)
+        tree = ttk.Treeview(
+            table,
+            columns=("category", "number", "last", "first", "detail"),
+            show="headings",
+            yscrollcommand=scroll.set,
+        )
+        scroll.config(command=tree.yview)
+        for key, title, width in (
+            ("category", "Kategorie", 130),
+            ("number", "Nummer", 80),
+            ("last", "Nachname", 170),
+            ("first", "Vorname", 170),
+            ("detail", "Hinweis", 390),
+        ):
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=60)
+        tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+
+        def add_row(category, student, detail=""):
+            tree.insert(
+                "",
+                tk.END,
+                values=(category, student.number, student.last_name, student.first_name, detail),
+            )
+
+        for student in preview.new:
+            add_row("Neu", student, "Wird hinzugefügt")
+        for student in preview.unchanged:
+            add_row("Unverändert", student)
+        for issue in preview.conflicts:
+            add_row("Konflikt", issue.student, issue.reason)
+        for issue in preview.duplicates:
+            add_row("Duplikat", issue.student, issue.reason)
+        for student in preview.missing:
+            add_row("Fehlt in neuer Liste", student, "Bleibt erhalten")
+
+        note = (
+            "Es werden ausschließlich neue, konfliktfreie Einträge hinzugefügt. "
+            "Konflikte und Duplikate werden übersprungen; fehlende historische "
+            "Einträge bleiben unverändert. Vor dem atomaren Schreiben wird ein Backup erstellt."
+        )
+        ttk.Label(dialog, text=note, wraplength=950).grid(
+            row=2, column=0, sticky=tk.W, padx=10, pady=(8, 4)
+        )
+        actions = ttk.Frame(dialog)
+        actions.grid(row=3, column=0, sticky=tk.E, padx=10, pady=(4, 10))
+
+        def apply_preview():
+            if not messagebox.askyesno(
+                "Import bestätigen",
+                f"{len(preview.new)} neue Schüler jetzt importieren?",
+                parent=dialog,
+            ):
+                return
+            try:
+                result = self.student_admin.apply_import(preview, confirmed=True)
+            except Exception as error:
+                messagebox.showerror("Import fehlgeschlagen", str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self._after_student_change()
+            backup = f"\nBackup: {result.backup_path}" if result.backup_path else ""
+            messagebox.showinfo(
+                "Import abgeschlossen",
+                f"{len(result.added)} Schüler hinzugefügt.{backup}",
+            )
+
+        ttk.Button(actions, text="Abbrechen", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(
+            actions,
+            text="Import ausdrücklich bestätigen",
+            command=apply_preview,
+            state=tk.NORMAL if preview.new else tk.DISABLED,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
     @staticmethod
     def _detail_row(parent, row: int, title: str, wrap: int = 280):
@@ -529,6 +919,10 @@ class PDFRenamerGUI:
         result = self.review_actions.apply(request)
         icon = "✅" if result.succeeded else "⚠️" if result.status == ReviewActionStatus.PARTIAL else "❌"
         self.log_message(f"{icon} {result.message}")
+        if result.registry_saved or result.student_alias_saved:
+            self._after_student_change(
+                result.student.number if result.student is not None else None
+            )
         if result.succeeded:
             if result.subject_alias_saved:
                 self.log_message("📚 Fachalias wurde gespeichert.")

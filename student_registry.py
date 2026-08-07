@@ -64,6 +64,14 @@ class Student:
 
 
 @dataclass(frozen=True)
+class StudentAlias:
+    """Public, read-only view of one confirmed student alias."""
+
+    name: str
+    student_number: int
+
+
+@dataclass(frozen=True)
 class StudentSuggestion:
     """A fuzzy candidate and its similarity score (0.0 to 1.0)."""
 
@@ -202,6 +210,18 @@ class StudentRegistry:
     @property
     def students(self) -> Tuple[Student, ...]:
         return self._students
+
+    @property
+    def aliases(self) -> Tuple[StudentAlias, ...]:
+        """Return aliases in deterministic display order."""
+
+        return tuple(
+            StudentAlias(alias.name, alias.student_number)
+            for _, alias in sorted(
+                self._aliases.items(),
+                key=lambda item: (item[1].student_number, item[0]),
+            )
+        )
 
     @property
     def is_available(self) -> bool:
@@ -363,6 +383,21 @@ class StudentRegistry:
 
     add_alias = confirm_existing
 
+    def remove_alias(self, alias_name: str) -> bool:
+        """Remove one erroneous alias without changing its canonical student."""
+
+        self._require_available()
+        clean_name = _clean_display(alias_name, "alias_name")
+        alias_key = normalize_name(clean_name)
+        if alias_key not in self._aliases:
+            return False
+
+        updated = dict(self._aliases)
+        del updated[alias_key]
+        self._write_aliases(updated)
+        self._aliases = updated
+        return True
+
     def add_student(
         self,
         last_name: str,
@@ -435,6 +470,67 @@ class StudentRegistry:
         return replacement
 
     edit_student = update_student
+
+    def merge_students(
+        self,
+        students: Iterable[Student],
+        *,
+        create_backup: bool = True,
+    ) -> Optional[Path]:
+        """Atomically append explicitly reviewed rows without deleting history.
+
+        This bulk operation is used by the registry import service so a monthly
+        import is one all-or-nothing CSV replacement instead of a sequence of
+        partially committed ``add_student`` calls.  Existing numbers and names
+        are never overwritten by this method.
+        """
+
+        self._require_available()
+        additions = tuple(students)
+        if not additions:
+            return None
+
+        existing_numbers = set(self._students_by_number)
+        addition_numbers = set()
+        addition_names = set()
+        for student in additions:
+            if student.number in existing_numbers:
+                raise RegistryValidationError(
+                    f"Student number {student.number} already exists."
+                )
+            if student.number in addition_numbers:
+                raise RegistryValidationError(
+                    f"Duplicate student number {student.number}."
+                )
+            addition_numbers.add(student.number)
+            self._ensure_unique_canonical(student.last_name, student.first_name)
+            name_key = (
+                normalize_name(student.last_name),
+                normalize_name(student.first_name),
+            )
+            if name_key in addition_names:
+                raise RegistryValidationError(
+                    "A canonical student with this first and last name already exists."
+                )
+            addition_names.add(name_key)
+
+        updated = tuple(sorted(self._students + additions, key=lambda item: item.number))
+        self._validate_students_for_write(updated)
+        self._validate_alias_conflicts(updated, self._aliases)
+        schema = self._schema_or_raise()
+        needs_active_migration = (
+            not schema.has_active and any(not student.active for student in additions)
+        )
+        backup = (
+            self._create_backup(self.csv_path)
+            if create_backup or needs_active_migration
+            else None
+        )
+        if needs_active_migration:
+            schema = _CsvSchema(schema.first_name_header, True)
+        self._write_students(updated, schema)
+        self._commit_students(updated, schema)
+        return backup
 
     def create_backup(self) -> Path:
         """Create a non-overwriting backup of the canonical CSV."""
@@ -799,6 +895,7 @@ __all__ = [
     "RegistryValidationError",
     "RegistryWriteError",
     "Student",
+    "StudentAlias",
     "StudentMatch",
     "StudentRegistry",
     "StudentRegistryError",
