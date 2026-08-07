@@ -31,6 +31,14 @@ class TextParser:
         if cls._alias_manager is None:
             cls._alias_manager = AliasManager(create_if_missing=False)
         return cls._alias_manager
+
+    @classmethod
+    def set_alias_manager(cls, manager: AliasManager) -> None:
+        """Use a shared alias manager so newly confirmed aliases apply at once."""
+
+        if not isinstance(manager, AliasManager):
+            raise TypeError("manager must be an AliasManager")
+        cls._alias_manager = manager
     
     @classmethod
     def _load_subjects_config(cls) -> Dict[str, any]:
