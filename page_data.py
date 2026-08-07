@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 
 class ExtractionSource(str, Enum):
@@ -21,6 +21,7 @@ class PageWord:
     top: float
     x1: float
     bottom: float
+    confidence: Optional[float] = None
 
     @property
     def center_x(self) -> float:
@@ -52,11 +53,14 @@ class PageData:
     words: Tuple[PageWord, ...] = field(default_factory=tuple)
     characters: Tuple[PageCharacter, ...] = field(default_factory=tuple)
     source: ExtractionSource = ExtractionSource.PDF_TEXT
+    diagnostics: Tuple[str, ...] = field(default_factory=tuple)
+    ocr_status: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Accept lists from adapters and synthetic tests while exposing immutable data.
         object.__setattr__(self, "words", tuple(self.words))
         object.__setattr__(self, "characters", tuple(self.characters))
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     @property
     def chars(self) -> Tuple[PageCharacter, ...]:

@@ -56,6 +56,8 @@ class FormParseResult:
     confidence: float
     reasons: Tuple[str, ...]
     warnings: Tuple[str, ...] = ()
+    name_confidence: Optional[float] = None
+    subject_confidence: Optional[float] = None
 
     @property
     def raw_name(self) -> Optional[str]:
@@ -89,6 +91,14 @@ class FormParseResult:
             or not self.subject
             or bool(self.warnings)
             or self.confidence < 0.75
+            or (
+                self.name_confidence is not None
+                and self.name_confidence < OCR_FIELD_CONFIDENCE_THRESHOLD
+            )
+            or (
+                self.subject_confidence is not None
+                and self.subject_confidence < OCR_FIELD_CONFIDENCE_THRESHOLD
+            )
         )
 
     def as_legacy_tuple(self) -> Tuple[Optional[str], Optional[str]]:
@@ -100,6 +110,53 @@ def _normalized_key(value: str) -> str:
 
     decomposed = unicodedata.normalize("NFKD", value.casefold())
     return "".join(char for char in decomposed if char.isalnum())
+
+
+OCR_FIELD_CONFIDENCE_THRESHOLD = 0.70
+
+
+def _ocr_confidence_for_text(page: PageData, value: Optional[str]) -> Optional[float]:
+    """Return mean word confidence for a parsed OCR field, if traceable."""
+
+    source = getattr(page.source, "value", page.source)
+    if source != "ocr" or not value:
+        return None
+    target = _normalized_key(value)
+    if not target:
+        return None
+    words = [word for word in _ordered_words(page) if _normalized_key(word.text)]
+    matched_confidences: List[float] = []
+    for start in range(len(words)):
+        combined = ""
+        selected: List[PageWord] = []
+        for word in words[start:start + 12]:
+            combined += _normalized_key(word.text)
+            selected.append(word)
+            if combined == target:
+                confidences = [
+                    word.confidence for word in selected if word.confidence is not None
+                ]
+                if len(confidences) != len(selected):
+                    continue
+                matched_confidences.extend(confidences)
+                break
+            if len(combined) >= len(target) or not target.startswith(combined):
+                break
+    if not matched_confidences:
+        return None
+    return sum(matched_confidences) / len(matched_confidences)
+
+
+def _add_low_ocr_confidence_warning(
+    warnings: List[str],
+    label: str,
+    confidence: Optional[float],
+) -> None:
+    if confidence is not None and confidence < OCR_FIELD_CONFIDENCE_THRESHOLD:
+        warnings.append(
+            f"Niedrige OCR-Konfidenz für {label} ({confidence:.0%}); "
+            "keine automatische Umbenennung."
+        )
 
 
 def _box_for(words: Sequence[PageWord]) -> BoundingBox:
@@ -232,6 +289,10 @@ class LegacyFormParser:
         confidence = detection.confidence
         if not name or not subject:
             confidence = min(confidence, 0.55)
+        name_confidence = _ocr_confidence_for_text(page, name)
+        subject_confidence = _ocr_confidence_for_text(page, raw_subject or subject)
+        _add_low_ocr_confidence_warning(warnings, "Schülername", name_confidence)
+        _add_low_ocr_confidence_warning(warnings, "Fach", subject_confidence)
 
         return FormParseResult(
             form_type=FormType.LEGACY,
@@ -242,6 +303,8 @@ class LegacyFormParser:
             confidence=confidence,
             reasons=tuple(reasons),
             warnings=tuple(warnings),
+            name_confidence=name_confidence,
+            subject_confidence=subject_confidence,
         )
 
     @staticmethod
@@ -274,6 +337,10 @@ class AttendanceFormParser:
         confidence = detection.confidence
         if not raw_name or not subject:
             confidence = min(confidence, 0.55)
+        name_confidence = _ocr_confidence_for_text(page, raw_name)
+        subject_confidence = _ocr_confidence_for_text(page, raw_subject or subject)
+        _add_low_ocr_confidence_warning(warnings, "Schülername", name_confidence)
+        _add_low_ocr_confidence_warning(warnings, "Fach", subject_confidence)
         if warnings:
             confidence = min(confidence, 0.70)
 
@@ -286,6 +353,8 @@ class AttendanceFormParser:
             confidence=confidence,
             reasons=tuple(reasons),
             warnings=tuple(warnings),
+            name_confidence=name_confidence,
+            subject_confidence=subject_confidence,
         )
 
     def _extract_name(

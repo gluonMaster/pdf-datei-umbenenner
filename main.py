@@ -9,7 +9,8 @@ from typing import List, Optional, Tuple
 
 from file_renamer import FileRenamer
 from form_parser import FormParser
-from pdf_extractor import PDFExtractor
+from ocr import TesseractOCRProvider
+from pdf_extractor import OCRFallbackExtractor, PDFExtractor
 from processing_service import (
     BatchProcessingResult,
     DocumentProcessingService,
@@ -33,6 +34,7 @@ class PDFRenamerApp:
         year: Optional[int] = None,
         *,
         service: Optional[DocumentProcessingService] = None,
+        tesseract_path: Optional[str] = None,
     ) -> None:
         if month is None or year is None:
             raise ValueError("Monat und Jahr müssen explizit angegeben werden.")
@@ -48,7 +50,10 @@ class PDFRenamerApp:
             review_store = ReviewStore(self.input_folder / "manual_review.json")
             review_store.load()
             service = DocumentProcessingService(
-                extractor=PDFExtractor(),
+                extractor=OCRFallbackExtractor(
+                    PDFExtractor(),
+                    TesseractOCRProvider(tesseract_path),
+                ),
                 parser=FormParser(),
                 student_registry=StudentRegistry(
                     registry_paths.csv_path,
@@ -204,6 +209,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Monat (1-12) für Dateinamen",
     )
     parser.add_argument("--year", type=int, help="Jahr für Dateinamen")
+    parser.add_argument(
+        "--tesseract-path",
+        type=str,
+        help=(
+            "Optionaler Pfad zu tesseract.exe; sonst werden TESSERACT_CMD, "
+            "PATH und Standardordner geprüft"
+        ),
+    )
     return parser
 
 
@@ -244,6 +257,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         dry_run=args.dry_run,
         month=args.month,
         year=args.year,
+        tesseract_path=args.tesseract_path,
     )
     app.run()
 

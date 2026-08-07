@@ -49,6 +49,8 @@ class FoundDocumentData:
     confidence: float = 0.0
     reasons: Tuple[str, ...] = ()
     warnings: Tuple[str, ...] = ()
+    name_confidence: Optional[float] = None
+    subject_confidence: Optional[float] = None
 
     @property
     def raw_name(self) -> Optional[str]:
@@ -76,6 +78,7 @@ class ProcessingResult:
     performed_action: PerformedAction = PerformedAction.NONE
     review_item: Optional[ReviewItem] = None
     warnings: Tuple[str, ...] = ()
+    ocr_status: Optional[str] = None
     error: Optional[str] = None
 
     @property
@@ -185,6 +188,8 @@ class DocumentProcessingService:
         student_match = None
         subject_validation = None
         canonical_subject = None
+        ocr_status = None
+        extraction_review_reasons: Tuple[str, ...] = ()
 
         try:
             self._validate_period(month, year)
@@ -193,6 +198,14 @@ class DocumentProcessingService:
             stages.append(ProcessingStage.EXTRACTION)
             if extraction is None:
                 raise ValueError("Text und Layout konnten nicht aus der PDF gelesen werden.")
+            ocr_status = getattr(extraction, "ocr_status", None)
+            if ocr_status and ocr_status != "OCR success":
+                extraction_review_reasons = tuple(
+                    str(item)
+                    for item in (getattr(extraction, "diagnostics", ()) or ())
+                    if item
+                ) or (str(ocr_status),)
+                warnings.extend(extraction_review_reasons)
 
             raw_parse_result = self._parse(extraction)
             found_data, form_type = self._found_data(raw_parse_result)
@@ -222,6 +235,7 @@ class DocumentProcessingService:
                 found_data,
                 student_match,
                 subject_validation,
+                extraction_review_reasons,
             )
             if review_reasons:
                 return self._plan_review(
@@ -279,6 +293,7 @@ class DocumentProcessingService:
                 planned_action=PlannedAction.RENAME,
                 performed_action=performed_action,
                 warnings=tuple(dict.fromkeys(warnings)),
+                ocr_status=ocr_status,
             )
         except Exception as error:
             return ProcessingResult(
@@ -295,6 +310,7 @@ class DocumentProcessingService:
                 canonical_subject=canonical_subject,
                 performed_action=PerformedAction.ERROR,
                 warnings=tuple(dict.fromkeys(warnings)),
+                ocr_status=ocr_status,
                 error=str(error) or error.__class__.__name__,
             )
 
@@ -401,6 +417,8 @@ class DocumentProcessingService:
         reasons = tuple(str(item) for item in (getattr(parsed, "reasons", ()) or ()))
         warnings = tuple(str(item) for item in (getattr(parsed, "warnings", ()) or ()))
         confidence = float(getattr(parsed, "confidence", 0.0) or 0.0)
+        name_confidence = getattr(parsed, "name_confidence", None)
+        subject_confidence = getattr(parsed, "subject_confidence", None)
         return (
             FoundDocumentData(
                 raw_name,
@@ -410,6 +428,8 @@ class DocumentProcessingService:
                 confidence,
                 reasons,
                 warnings,
+                name_confidence,
+                subject_confidence,
             ),
             form_type,
         )
@@ -447,8 +467,9 @@ class DocumentProcessingService:
         found_data: FoundDocumentData,
         student_match: Any,
         subject_validation: Any,
+        extraction_reasons: Tuple[str, ...] = (),
     ) -> Tuple[str, ...]:
-        reasons = []
+        reasons = list(extraction_reasons)
         if form_type == FormType.UNKNOWN.value:
             reasons.append("Formulartyp konnte nicht sicher erkannt werden.")
         if bool(getattr(raw_parse_result, "requires_review", False)):
@@ -523,6 +544,12 @@ class DocumentProcessingService:
             selected_month=month,
             selected_year=year,
             planned_filename=planned_path.name,
+            extraction_source=str(
+                self._value(getattr(extraction, "source", "")) or ""
+            ) or None,
+            ocr_status=getattr(extraction, "ocr_status", None),
+            ocr_name_confidence=found_data.name_confidence,
+            ocr_subject_confidence=found_data.subject_confidence,
         )
 
         performed_action = PerformedAction.NONE
@@ -553,6 +580,7 @@ class DocumentProcessingService:
             performed_action=performed_action,
             review_item=review_item,
             warnings=tuple(dict.fromkeys(warnings)),
+            ocr_status=getattr(extraction, "ocr_status", None),
         )
 
     @staticmethod

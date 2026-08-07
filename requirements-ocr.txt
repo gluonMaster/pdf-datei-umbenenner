@@ -1,0 +1,2 @@
+# Optional first-page OCR rendering. Tesseract itself is a separate system install.
+PyMuPDF>=1.24

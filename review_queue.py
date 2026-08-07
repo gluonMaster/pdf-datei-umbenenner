@@ -41,6 +41,10 @@ class ReviewItem:
     selected_month: Optional[int] = None
     selected_year: Optional[int] = None
     planned_filename: Optional[str] = None
+    extraction_source: Optional[str] = None
+    ocr_status: Optional[str] = None
+    ocr_name_confidence: Optional[float] = None
+    ocr_subject_confidence: Optional[float] = None
     
     def to_dict(self) -> dict:
         """Преобразует ReviewItem в словарь"""

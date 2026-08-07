@@ -17,7 +17,7 @@ from file_opener import FileOpener
 from file_renamer import FileRenamer
 from form_parser import FormParser
 from gui_processing import BatchRunner, BatchSettings, WorkerEventKind
-from pdf_extractor import PDFExtractor
+from pdf_extractor import OCRFallbackExtractor
 from processing_service import DocumentProcessingService, PlannedAction
 from review_actions import (
     ReviewActionRequest,
@@ -56,7 +56,7 @@ class PDFRenamerGUI:
         self.worker_events: queue.Queue = queue.Queue()
 
         project_folder = Path(__file__).parent
-        self.extractor = PDFExtractor()
+        self.extractor = OCRFallbackExtractor()
         self.parser = FormParser()
         self.validator = Validator()
         self.renamer = FileRenamer()
