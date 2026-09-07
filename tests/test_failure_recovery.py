@@ -604,6 +604,8 @@ def test_gui_worker_start_failure_restores_idle_state(tmp_path, monkeypatch):
     gui.stop_event = threading.Event()
     gui.worker_events = queue.Queue()
     gui.batch_runner = type("Runner", (), {"run": lambda *_args: None})()
+    reloads = []
+    gui.load_review_queue = lambda **kwargs: reloads.append(kwargs)
     gui.progress_label = Label()
     control_states = []
     gui._set_batch_controls = lambda running: control_states.append(running)
@@ -622,6 +624,7 @@ def test_gui_worker_start_failure_restores_idle_state(tmp_path, monkeypatch):
     assert gui.processing is False
     assert gui._active_batch_folder is None
     assert control_states == [True, False]
+    assert reloads == [{"reload_store": False}]
     assert "nicht gestartet" in gui.progress_label.values[-1]["text"]
     assert errors and "synthetic thread failure" in errors[0][1]
 

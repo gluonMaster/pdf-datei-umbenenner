@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,7 @@ class BatchRunner:
         emit: Callable[[WorkerEvent], None],
     ) -> None:
         stopped = False
+        fatal_error = None
         try:
             service = self.processing_service
             service.manual_review_folder = settings.folder / "manual_check"
@@ -104,12 +105,15 @@ class BatchRunner:
                     continue
                 emit(WorkerEvent(WorkerEventKind.RESULT, result))
 
-            if stop_event.is_set():
-                stopped = True
-
-            store = service.review_store
-            if not settings.dry_run and store.count() > 0:
-                try:
+        except Exception as error:
+            fatal_error = str(error) or error.__class__.__name__
+        finally:
+            stopped = stopped or stop_event.is_set()
+            # A fatal batch error must still give pending recovery entries a
+            # chance to reach disk, before the main thread displays the queue.
+            try:
+                store = self.processing_service.review_store
+                if not settings.dry_run and store.count() > 0:
                     if store.save():
                         emit(
                             WorkerEvent(
@@ -124,22 +128,17 @@ class BatchRunner:
                                 "Warteschlange konnte nicht gespeichert werden.",
                             )
                         )
-                except Exception as error:
-                    emit(
-                        WorkerEvent(
-                            WorkerEventKind.QUEUE_ERROR,
-                            str(error) or error.__class__.__name__,
-                        )
+            except Exception as error:
+                emit(
+                    WorkerEvent(
+                        WorkerEventKind.QUEUE_ERROR,
+                        str(error) or error.__class__.__name__,
                     )
-            emit(WorkerEvent(WorkerEventKind.COMPLETED, stopped))
-        except Exception as error:
-            emit(
-                WorkerEvent(
-                    WorkerEventKind.FATAL,
-                    str(error) or error.__class__.__name__,
                 )
-            )
-        finally:
+            if fatal_error is not None:
+                emit(WorkerEvent(WorkerEventKind.FATAL, fatal_error))
+            else:
+                emit(WorkerEvent(WorkerEventKind.COMPLETED, stopped))
             emit(WorkerEvent(WorkerEventKind.FINISHED, stopped))
 
 

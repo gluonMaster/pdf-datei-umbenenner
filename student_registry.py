@@ -8,11 +8,12 @@ and route every non-exact result to manual review.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from enum import Enum
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -118,6 +119,9 @@ class RegistryWriteError(StudentRegistryError, OSError):
 class _CsvSchema:
     first_name_header: str
     has_active: bool
+    fieldnames: Tuple[str, ...] = ()
+    extra_values: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
+    encoding: str = "utf-8-sig"
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,8 @@ def _clean_display(value: str, field_name: str) -> str:
     cleaned = " ".join(unicodedata.normalize("NFC", value).split())
     if not cleaned:
         raise RegistryValidationError(f"{field_name} darf nicht leer sein.")
+    if any(unicodedata.category(char) in {"Cc", "Cs"} for char in cleaned):
+        raise RegistryValidationError(f"{field_name} enthält ungültige Steuerzeichen.")
     return cleaned
 
 
@@ -161,6 +167,31 @@ def _parse_active(value: object, row_number: int) -> bool:
         f"Zeile {row_number}: Aktiv muss Ja/Nein beziehungsweise 1/0 sein; "
         f"erhalten: {value!r}."
     )
+
+
+def _parse_student_number(value: object) -> int:
+    """Accept integer IDs and decimal text, never truncate floats or booleans."""
+
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
+        number = int(value.strip())
+    else:
+        raise RegistryValidationError("Die Schülernummer muss eine positive Ganzzahl sein.")
+    if number <= 0:
+        raise RegistryValidationError("Die Schülernummer muss eine positive Ganzzahl sein.")
+    return number
+
+
+def _unique_json_object(pairs):
+    """Do not silently discard conflicting keys in a damaged alias file."""
+
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RegistryValidationError(f"Doppelter Schlüssel in Alias-JSON: {key!r}.")
+        result[key] = value
+    return result
 
 
 class StudentRegistry:
@@ -188,7 +219,7 @@ class StudentRegistry:
             if aliases_path is not None
             else self.csv_path.with_name("student_aliases.json")
         )
-        if suggestion_limit < 1:
+        if type(suggestion_limit) is not int or suggestion_limit < 1:
             raise ValueError("Die Anzahl der Vorschläge muss mindestens 1 sein.")
         if not 0.0 <= fuzzy_threshold <= 1.0:
             raise ValueError(
@@ -198,7 +229,7 @@ class StudentRegistry:
             raise ValueError(
                 "Der Schwellenwert für Mehrdeutigkeiten muss zwischen 0 und 1 liegen."
             )
-        if ambiguity_delta < 0.0:
+        if not math.isfinite(ambiguity_delta) or ambiguity_delta < 0.0:
             raise ValueError("Die Toleranz für Mehrdeutigkeiten darf nicht negativ sein.")
 
         self.suggestion_limit = suggestion_limit
@@ -208,6 +239,7 @@ class StudentRegistry:
         self._students: Tuple[Student, ...] = ()
         self._students_by_number: Dict[int, Student] = {}
         self._aliases: Dict[str, _Alias] = {}
+        self._aliases_need_migration = False
         self._schema: Optional[_CsvSchema] = None
         self._load_error: Optional[str] = None
         self.reload()
@@ -246,13 +278,14 @@ class StudentRegistry:
         try:
             students, schema = self._read_students(self.csv_path)
             by_number = {student.number: student for student in students}
-            aliases = self._read_aliases(self.aliases_path, by_number)
+            aliases, aliases_need_migration = self._read_aliases(self.aliases_path, by_number)
             self._validate_alias_conflicts(students, aliases)
         except (OSError, UnicodeError, csv.Error, json.JSONDecodeError,
                 RegistryValidationError, TypeError, ValueError) as exc:
             self._students = ()
             self._students_by_number = {}
             self._aliases = {}
+            self._aliases_need_migration = False
             self._schema = None
             self._load_error = (
                 f"Das Schülerverzeichnis ist nicht verfügbar: {exc}. "
@@ -263,6 +296,7 @@ class StudentRegistry:
         self._students = students
         self._students_by_number = by_number
         self._aliases = aliases
+        self._aliases_need_migration = aliases_need_migration
         self._schema = schema
         self._load_error = None
         return True
@@ -290,7 +324,9 @@ class StudentRegistry:
                 "Der erkannte Schülername ist leer; eine manuelle Bestätigung ist erforderlich.",
             )
 
-        exact = self._exact_candidates(key)
+        return self._match_key(key, self._exact_candidates(key))
+
+    def _match_key(self, key: str, exact: Tuple[Student, ...]) -> StudentMatch:
         if len(exact) == 1:
             student = exact[0]
             return StudentMatch(
@@ -312,7 +348,6 @@ class StudentRegistry:
             )
 
         ranked = self._fuzzy_suggestions(key)
-        suggestions = tuple(item.student for item in ranked)
         status = MatchStatus.UNKNOWN
         reason = (
             "Kein exakter Schüler oder bestätigter Alias gefunden; "
@@ -326,17 +361,27 @@ class StudentRegistry:
         ):
             status = MatchStatus.AMBIGUOUS
             reason = "Mehrere ähnlich passende Schüler erfordern eine manuelle Auswahl."
+        ranked = ranked[:self.suggestion_limit]
+        suggestions = tuple(item.student for item in ranked)
         return StudentMatch(status, None, suggestions, reason, ranked)
 
     def match_parts(self, last_name: str, first_name: str) -> StudentMatch:
-        """Match explicit name fields in the registry's canonical order."""
+        """Match known field boundaries without exchanging first and last names."""
 
+        if not self.is_available:
+            return self.match("")
         try:
-            raw_name = f"{_clean_display(last_name, 'Nachname')} " \
-                       f"{_clean_display(first_name, 'Vorname')}"
+            last_key = normalize_name(_clean_display(last_name, "Nachname"))
+            first_key = normalize_name(_clean_display(first_name, "Vorname"))
         except RegistryValidationError as exc:
             return StudentMatch(MatchStatus.UNKNOWN, None, (), str(exc))
-        return self.match(raw_name)
+        exact = tuple(sorted(
+            (student for student in self._students
+             if (normalize_name(student.last_name), normalize_name(student.first_name))
+             == (last_key, first_key)),
+            key=lambda student: student.number,
+        ))
+        return self._match_key(f"{last_key} {first_key}", exact)
 
     # Readable aliases for callers at different integration boundaries.
     match_name = match
@@ -347,7 +392,7 @@ class StudentRegistry:
 
         self._require_available()
         try:
-            return self._students_by_number[int(student_number)]
+            return self._students_by_number[_parse_student_number(student_number)]
         except (KeyError, TypeError, ValueError) as exc:
             raise RegistryValidationError(
                 f"Unbekannte Schülernummer: {student_number!r}."
@@ -427,6 +472,7 @@ class StudentRegistry:
         number = max(self._students_by_number, default=0) + 1
         student = Student(number, clean_last, clean_first, active)
         updated = self._students + (student,)
+        self._validate_alias_conflicts(updated, self._aliases)
         schema = self._schema_or_raise()
         schema = self._ensure_active_schema(schema, required=not active)
         self._write_students(updated, schema)
@@ -466,13 +512,18 @@ class StudentRegistry:
         new_active = current.active if active is None else active
         if not isinstance(new_active, bool):
             raise RegistryValidationError("Der Aktiv-Status muss wahr oder falsch sein.")
-        self._ensure_unique_canonical(clean_last, clean_first, except_number=current.number)
-
         replacement = Student(current.number, clean_last, clean_first, new_active)
+        if replacement == current:
+            return current
+        if (normalize_name(clean_last), normalize_name(clean_first)) != (
+            normalize_name(current.last_name), normalize_name(current.first_name)
+        ):
+            self._ensure_unique_canonical(clean_last, clean_first, except_number=current.number)
         updated = tuple(
             replacement if item.number == current.number else item
             for item in self._students
         )
+        self._validate_alias_conflicts(updated, self._aliases)
         schema = self._schema_or_raise()
         schema = self._ensure_active_schema(schema, required=not new_active)
         self._write_students(updated, schema)
@@ -499,6 +550,12 @@ class StudentRegistry:
         additions = tuple(students)
         if not additions:
             return None
+        self._validate_students_for_write(additions)
+        additions = tuple(
+            replace(student, last_name=_clean_display(student.last_name, "Nachname"),
+                    first_name=_clean_display(student.first_name, "Vorname"))
+            for student in additions
+        )
 
         existing_numbers = set(self._students_by_number)
         addition_numbers = set()
@@ -533,11 +590,11 @@ class StudentRegistry:
         )
         backup = (
             self._create_backup(self.csv_path)
-            if create_backup or needs_active_migration
+            if create_backup or len(additions) > 1 or needs_active_migration
             else None
         )
         if needs_active_migration:
-            schema = _CsvSchema(schema.first_name_header, True)
+            schema = replace(schema, has_active=True, fieldnames=schema.fieldnames + ("Aktiv",))
         self._write_students(updated, schema)
         self._commit_students(updated, schema)
         return backup
@@ -556,7 +613,11 @@ class StudentRegistry:
         if schema.first_name_header == "Vorname":
             return None
         backup = self._create_backup(self.csv_path)
-        migrated = _CsvSchema("Vorname", schema.has_active)
+        migrated = replace(
+            schema, first_name_header="Vorname",
+            fieldnames=tuple("Vorname" if name == "Forname" else name
+                             for name in schema.fieldnames),
+        )
         self._write_students(self._students, migrated)
         self._schema = migrated
         return backup
@@ -568,11 +629,15 @@ class StudentRegistry:
         if not path.is_file():
             raise RegistryValidationError(f"CSV-Pfad verweist nicht auf eine Datei: {path}")
 
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        with path.open("rb") as handle:
+            encoding = "utf-8-sig" if handle.read(3) == b"\xef\xbb\xbf" else "utf-8"
+        with path.open("r", encoding=encoding, newline="") as handle:
             reader = csv.DictReader(handle, delimiter=";", strict=True)
             if reader.fieldnames is None:
                 raise RegistryValidationError("CSV-Kopfzeile fehlt.")
             stripped_headers = [header.strip() for header in reader.fieldnames]
+            if not all(stripped_headers):
+                raise RegistryValidationError("CSV enthält eine leere Spaltenüberschrift.")
             if len(stripped_headers) != len(set(stripped_headers)):
                 raise RegistryValidationError("CSV enthält doppelte Spaltenüberschriften.")
             header_map = dict(zip(stripped_headers, reader.fieldnames))
@@ -586,7 +651,11 @@ class StudentRegistry:
                     "CSV muss entweder Vorname oder die veraltete Spalte Forname enthalten."
                 )
             first_header = "Vorname" if "Vorname" in first_headers else "Forname"
-            schema = _CsvSchema(first_header, "Aktiv" in header_map)
+            extra_values = {}
+            schema = _CsvSchema(
+                first_header, "Aktiv" in header_map, tuple(stripped_headers),
+                extra_values, encoding,
+            )
 
             students = []
             numbers = set()
@@ -598,9 +667,11 @@ class StudentRegistry:
                 values = ["" if value is None else str(value) for value in row.values()]
                 if not any(value.strip() for value in values):
                     continue
+                if any(value is None for value in row.values()):
+                    raise RegistryValidationError(f"Zeile {row_number} enthält zu wenige Felder.")
                 raw_number = row.get(header_map["Nummer"], "")
                 try:
-                    number = int(str(raw_number).strip())
+                    number = _parse_student_number(raw_number)
                 except (TypeError, ValueError) as exc:
                     raise RegistryValidationError(
                         f"Zeile {row_number}: Nummer muss eine Ganzzahl sein."
@@ -623,6 +694,16 @@ class StudentRegistry:
                     row.get(header_map[first_header], ""),
                     f"Zeile {row_number} {first_header}",
                 )
+                if len(first_headers) == 2 and normalize_name(first_name) != normalize_name(
+                    _clean_display(row[header_map["Forname"]], f"Zeile {row_number} Forname")
+                ):
+                    raise RegistryValidationError(
+                        f"Zeile {row_number}: Forname und Vorname widersprechen sich."
+                    )
+                extra_values[number] = {
+                    name: row[raw_header] for name, raw_header in header_map.items()
+                    if name not in {"Nummer", "Nachname", "Forname", "Vorname", "Aktiv"}
+                }
                 active_value = (
                     row.get(header_map["Aktiv"])
                     if schema.has_active
@@ -640,23 +721,25 @@ class StudentRegistry:
     def _read_aliases(
         path: Path,
         students_by_number: Mapping[int, Student],
-    ) -> Dict[str, _Alias]:
+    ) -> Tuple[Dict[str, _Alias], bool]:
         if not path.exists():
-            return {}
+            return {}, False
         if not path.is_file():
             raise RegistryValidationError(f"Alias-Pfad verweist nicht auf eine Datei: {path}")
         with path.open("r", encoding="utf-8-sig") as handle:
-            payload = json.load(handle)
+            payload = json.load(handle, object_pairs_hook=_unique_json_object)
         if not isinstance(payload, dict):
             raise RegistryValidationError(
                 "Das Wurzelelement der Alias-JSON-Datei muss ein Objekt sein."
             )
         version = payload.get("version", 1)
-        if version != 1:
+        if type(version) is not int or version != 1:
             raise RegistryValidationError(
                 f"Nicht unterstützte Version des Aliasformats: {version!r}."
             )
-        raw_aliases = payload.get("aliases", {})
+        if "aliases" not in payload:
+            raise RegistryValidationError("Das Feld 'aliases' fehlt in der Alias-JSON-Datei.")
+        raw_aliases = payload["aliases"]
         entries = []
         if isinstance(raw_aliases, dict):
             # Compatibility with the original compact {alias: number} layout.
@@ -681,7 +764,7 @@ class StudentRegistry:
                 entry.get("name"), f"Name in Aliaseintrag {position}"
             )
             try:
-                student_number = int(entry.get("student_number"))
+                student_number = _parse_student_number(entry.get("student_number"))
             except (TypeError, ValueError) as exc:
                 raise RegistryValidationError(
                     f"Aliaseintrag {position} enthält im Feld 'student_number' "
@@ -699,7 +782,7 @@ class StudentRegistry:
                     f"Alias {name!r} ist mehreren Schülern zugeordnet."
                 )
             aliases[key] = _Alias(name, student_number)
-        return aliases
+        return aliases, isinstance(raw_aliases, dict)
 
     @staticmethod
     def _validate_alias_conflicts(
@@ -753,7 +836,7 @@ class StudentRegistry:
             if score >= self.fuzzy_threshold:
                 ranked.append(StudentSuggestion(student, round(score, 6)))
         ranked.sort(key=lambda item: (-item.score, item.student.number))
-        return tuple(ranked[:self.suggestion_limit])
+        return tuple(ranked)
 
     def _ensure_unique_canonical(
         self,
@@ -783,7 +866,7 @@ class StudentRegistry:
             return schema
         # Adding Aktiv is a schema migration, so preserve the original first.
         self._create_backup(self.csv_path)
-        return _CsvSchema(schema.first_name_header, True)
+        return replace(schema, has_active=True, fieldnames=schema.fieldnames + ("Aktiv",))
 
     def _write_students(
         self,
@@ -791,10 +874,9 @@ class StudentRegistry:
         schema: _CsvSchema,
     ) -> None:
         self._validate_students_for_write(students)
+        self._validate_alias_conflicts(students, self._aliases)
         output = io.StringIO(newline="")
-        fieldnames = ["Nummer", "Nachname", schema.first_name_header]
-        if schema.has_active:
-            fieldnames.append("Aktiv")
+        fieldnames = schema.fieldnames
         writer = csv.DictWriter(
             output,
             fieldnames=fieldnames,
@@ -804,15 +886,19 @@ class StudentRegistry:
         )
         writer.writeheader()
         for student in students:
-            row = {
+            row = dict(schema.extra_values.get(student.number, {}))
+            row.update({
                 "Nummer": student.number,
                 "Nachname": student.last_name,
                 schema.first_name_header: student.first_name,
-            }
+            })
+            for name in ("Forname", "Vorname"):
+                if name in fieldnames:
+                    row[name] = student.first_name
             if schema.has_active:
                 row["Aktiv"] = "1" if student.active else "0"
             writer.writerow(row)
-        self._atomic_write_bytes(self.csv_path, output.getvalue().encode("utf-8-sig"))
+        self._atomic_write_bytes(self.csv_path, output.getvalue().encode(schema.encoding))
 
     @staticmethod
     def _validate_students_for_write(students: Sequence[Student]) -> None:
@@ -820,7 +906,7 @@ class StudentRegistry:
             raise RegistryValidationError("Mindestens ein Schülereintrag ist erforderlich.")
         numbers = set()
         for student in students:
-            if not isinstance(student.number, int) or student.number <= 0:
+            if not isinstance(student, Student) or type(student.number) is not int or student.number <= 0:
                 raise RegistryValidationError(
                     "Jede Schülernummer muss eine positive Ganzzahl sein."
                 )
@@ -850,18 +936,22 @@ class StudentRegistry:
         encoded = (
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         ).encode("utf-8")
+        if self._aliases_need_migration:
+            self._create_backup(self.aliases_path)
         self._atomic_write_bytes(self.aliases_path, encoded)
+        self._aliases_need_migration = False
 
     @staticmethod
     def _atomic_write_bytes(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        temporary = Path(temporary_name)
+        temporary = None
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(data)
                 handle.flush()
@@ -869,7 +959,8 @@ class StudentRegistry:
             os.replace(temporary, path)
         except Exception as exc:
             try:
-                temporary.unlink(missing_ok=True)
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
             except OSError:
                 pass
             if isinstance(exc, StudentRegistryError):

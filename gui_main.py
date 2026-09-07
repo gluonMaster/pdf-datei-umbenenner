@@ -872,7 +872,7 @@ class PDFRenamerGUI:
         if self.current_review_item and self.current_review_item.file_path == file_path:
             return
         self.current_review_item = review_item
-        self.file_label.config(text=Path(file_path).name)
+        self.file_label.config(text=str(self.review_store.store_path.parent / file_path))
         self.form_type_label.config(text=review_item.form_type or "Unbekannt")
         self.raw_name_label.config(text=review_item.raw_name or "—")
         self.reason_label.config(text=review_item.reason or "—")
@@ -916,6 +916,9 @@ class PDFRenamerGUI:
             "",
         )
         self.selected_student.set(selected)
+        if selected:
+            # The registry owns field boundaries, including compound surnames.
+            self._on_student_choice()
 
     def _on_student_choice(self, _event=None):
         number = self.student_choice_numbers.get(self.selected_student.get())
@@ -931,10 +934,10 @@ class PDFRenamerGUI:
 
     def on_review_item_double_click(self, _event=None):
         selection = self.review_tree.selection()
-        folder = self.selected_folder.get().strip()
-        if not selection or not folder:
+        if not selection:
             return
-        path = Path(folder) / self.review_tree.item(selection[0], "tags")[0]
+        file_path = self.review_tree.item(selection[0], "tags")[0]
+        path = self.review_store.store_path.parent / file_path
         if path.exists():
             FileOpener.open_pdf(path)
         else:
@@ -980,10 +983,9 @@ class PDFRenamerGUI:
         if not self.current_review_item:
             messagebox.showwarning("Warnung", "Bitte wählen Sie eine Datei aus.")
             return
-        folder = self.selected_folder.get().strip()
-        if not folder:
-            messagebox.showerror("Fehler", "Bitte wählen Sie einen Eingabeordner.")
-            return
+        # A displayed queue belongs to its loaded folder, even if the user has
+        # since typed a different input folder for the next batch.
+        folder = self.review_store.store_path.parent
         subject = self.edit_subject.get().strip()
         if subject and self.subjects and subject not in self.subjects:
             if not messagebox.askyesno(
@@ -992,8 +994,14 @@ class PDFRenamerGUI:
             ):
                 return
         try:
-            fallback_month = int(self.selected_month.get())
-            fallback_year = int(self.selected_year.get())
+            fallback_month = (
+                int(self.selected_month.get())
+                if self.current_review_item.selected_month is None else None
+            )
+            fallback_year = (
+                int(self.selected_year.get())
+                if self.current_review_item.selected_year is None else None
+            )
         except (tk.TclError, TypeError, ValueError):
             messagebox.showerror("Fehler", "Monat und Jahr sind ungültig.")
             return
@@ -1023,7 +1031,7 @@ class PDFRenamerGUI:
                 self.log_message("👤 Namensalias wurde gespeichert.")
             self.stats["success"] += 1
             self.update_statistics()
-            self.load_review_queue(reload_store=True)
+            self.load_review_queue(reload_store=False)
             self.clear_edit_fields()
         elif result.status == ReviewActionStatus.PARTIAL:
             self.load_review_queue(reload_store=False)
@@ -1116,7 +1124,11 @@ class PDFRenamerGUI:
             bool(self.dry_run_mode.get()),
         )
         self.review_store.store_path = settings.folder / "manual_review.json"
-        if not self.review_store.load():
+        loaded = self.review_store.load()
+        # Clear a selection from a previous folder even if starting the worker
+        # fails; the visible rows must always belong to the loaded store.
+        self.load_review_queue(reload_store=False)
+        if not loaded:
             self._show_review_load_error()
             return
         self.stats = self._empty_stats()
@@ -1257,6 +1269,8 @@ class PDFRenamerGUI:
         elif kind == WorkerEventKind.FATAL:
             self.stats["error"] += 1
             self.update_statistics()
+            self.progress_label.config(text="Verarbeitung fehlgeschlagen")
+            self.load_review_queue(reload_store=False)
             self.log_message(f"❌ Schwerwiegender Fehler: {event.payload}")
             if not self._close_requested:
                 messagebox.showerror("Fehler", f"Verarbeitung fehlgeschlagen:\n{event.payload}")

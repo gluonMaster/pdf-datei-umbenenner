@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
@@ -80,6 +80,8 @@ class ProcessingResult:
     warnings: Tuple[str, ...] = ()
     ocr_status: Optional[str] = None
     error: Optional[str] = None
+    actual_path: Optional[Path] = None
+    failed_stage: Optional[ProcessingStage] = None
 
     @property
     def planned_filename(self) -> Optional[str]:
@@ -114,11 +116,13 @@ class BatchProcessingResult:
 
     @property
     def renamed(self) -> int:
-        return sum(item.planned_action == PlannedAction.RENAME for item in self.results)
+        """Successful renames, or valid rename plans during a dry-run."""
+
+        return sum(item.succeeded for item in self.results)
 
     @property
     def manual_review(self) -> int:
-        return sum(item.requires_review for item in self.results)
+        return sum(item.requires_review and item.error is None for item in self.results)
 
     @property
     def errors(self) -> int:
@@ -190,14 +194,16 @@ class DocumentProcessingService:
         canonical_subject = None
         ocr_status = None
         extraction_review_reasons: Tuple[str, ...] = ()
+        current_stage = None
 
         try:
             self._validate_period(month, year)
 
+            current_stage = ProcessingStage.EXTRACTION
             extraction = self._extract(pdf_path)
-            stages.append(ProcessingStage.EXTRACTION)
             if extraction is None:
                 raise ValueError("Text und Layout konnten nicht aus der PDF gelesen werden.")
+            stages.append(ProcessingStage.EXTRACTION)
             ocr_status = getattr(extraction, "ocr_status", None)
             if ocr_status and ocr_status != "OCR success":
                 extraction_review_reasons = tuple(
@@ -207,15 +213,18 @@ class DocumentProcessingService:
                 ) or (str(ocr_status),)
                 warnings.extend(extraction_review_reasons)
 
+            current_stage = ProcessingStage.PARSING
             raw_parse_result = self._parse(extraction)
             found_data, form_type = self._found_data(raw_parse_result)
             stages.append(ProcessingStage.PARSING)
             warnings.extend(found_data.warnings)
 
             match_name = found_data.student_name or found_data.raw_student_name or ""
+            current_stage = ProcessingStage.STUDENT_MATCHING
             student_match = self._match_student(match_name)
             stages.append(ProcessingStage.STUDENT_MATCHING)
 
+            current_stage = ProcessingStage.SUBJECT_VALIDATION
             subject_validation = self._validate_subject(found_data.subject)
             stages.append(ProcessingStage.SUBJECT_VALIDATION)
             canonical_subject = (
@@ -237,8 +246,9 @@ class DocumentProcessingService:
                 subject_validation,
                 extraction_review_reasons,
             )
+            current_stage = ProcessingStage.PLANNING
             if review_reasons:
-                return self._plan_review(
+                plan = self._plan_review(
                     pdf_path=pdf_path,
                     month=month,
                     year=year,
@@ -253,6 +263,7 @@ class DocumentProcessingService:
                     canonical_subject=canonical_subject,
                     reasons=review_reasons,
                 )
+                return plan if dry_run else self._execute_plan(plan)
 
             student = getattr(student_match, "student", None)
             if student is None or not canonical_subject:
@@ -269,15 +280,7 @@ class DocumentProcessingService:
             )
             stages.append(ProcessingStage.PLANNING)
 
-            performed_action = PerformedAction.NONE
-            if not dry_run:
-                if not self.renamer.rename_file(pdf_path, planned_path):
-                    self._release_reservation(planned_path)
-                    raise OSError(f"Datei konnte nicht in {planned_path.name} umbenannt werden.")
-                performed_action = PerformedAction.RENAMED
-                stages.append(ProcessingStage.ACTION)
-
-            return ProcessingResult(
+            plan = ProcessingResult(
                 pdf_path=pdf_path,
                 month=month,
                 year=year,
@@ -292,10 +295,11 @@ class DocumentProcessingService:
                 planned_name=planned_path.name,
                 planned_path=planned_path,
                 planned_action=PlannedAction.RENAME,
-                performed_action=performed_action,
                 warnings=tuple(dict.fromkeys(warnings)),
                 ocr_status=ocr_status,
+                actual_path=pdf_path,
             )
+            return plan if dry_run else self._execute_plan(plan)
         except Exception as error:
             return ProcessingResult(
                 pdf_path=pdf_path,
@@ -313,6 +317,8 @@ class DocumentProcessingService:
                 warnings=tuple(dict.fromkeys(warnings)),
                 ocr_status=ocr_status,
                 error=str(error) or error.__class__.__name__,
+                actual_path=pdf_path,
+                failed_stage=current_stage,
             )
 
     # Short aliases used by CLI adapters and dependency-injected tests.
@@ -488,7 +494,10 @@ class DocumentProcessingService:
             match_reason = str(getattr(student_match, "reason", "") or "")
             reasons.append(match_reason or "Schüler muss manuell bestätigt werden.")
 
-        if self._validation_level(subject_validation) == ValidationLevel.MANUAL_CHECK.value:
+        if self._validation_level(subject_validation) not in (
+            ValidationLevel.VALID.value,
+            ValidationLevel.WARNING.value,
+        ):
             validation_reason = str(getattr(subject_validation, "message", "") or "")
             reasons.append(validation_reason or "Fach muss manuell bestätigt werden.")
         return tuple(dict.fromkeys(item for item in reasons if item))
@@ -526,7 +535,7 @@ class DocumentProcessingService:
             str(item) for item in (getattr(subject_validation, "suggestions", ()) or ())
         ]
         student = getattr(student_match, "student", None)
-        relative_path = self._review_path(pdf_path.parent, planned_path)
+        relative_path = self._review_path(self.review_store.store_path.parent, planned_path)
         review_item = ReviewItem(
             file_path=relative_path,
             raw_name=found_data.raw_student_name or found_data.student_name,
@@ -553,49 +562,6 @@ class DocumentProcessingService:
             ocr_subject_confidence=found_data.subject_confidence,
         )
 
-        performed_action = PerformedAction.NONE
-        if not dry_run:
-            if not self.renamer.move_file(pdf_path, planned_path):
-                self._release_reservation(planned_path)
-                raise OSError(
-                    f"Datei konnte nicht nach {planned_path.parent.name} verschoben werden."
-                )
-            self.review_store.add(review_item)
-            items_with_review = self.review_store.get_all()
-            previous_items = items_with_review[:-1]
-            try:
-                queue_saved = bool(self.review_store.save())
-            except Exception as error:
-                queue_saved = False
-                queue_error = str(error) or error.__class__.__name__
-            else:
-                queue_error = "unbekannter Speicherfehler"
-            if not queue_saved:
-                # Moving a PDF and updating JSON cannot be one filesystem
-                # transaction. Compensate immediately so a failed JSON write
-                # does not leave an unlisted document in manual_check.
-                self.review_store.items = previous_items
-                rolled_back = self.renamer.move_file(planned_path, pdf_path)
-                self._release_reservation(planned_path)
-                if rolled_back:
-                    raise OSError(
-                        "Warteschlange konnte nicht gespeichert werden; die PDF wurde "
-                        f"an ihren Ausgangsort zurückverschoben ({queue_error})."
-                    )
-
-                # Preserve the recovery information in memory and let the
-                # batch-level save retry once. The error names the actual file
-                # location so manual recovery remains possible even if storage
-                # stays unavailable.
-                self.review_store.items = items_with_review
-                raise OSError(
-                    "Warteschlange konnte nicht gespeichert und die PDF nicht "
-                    f"zurückverschoben werden. Datei liegt unter: {planned_path} "
-                    f"({queue_error})."
-                )
-            performed_action = PerformedAction.MOVED_TO_REVIEW
-            stages.append(ProcessingStage.ACTION)
-
         return ProcessingResult(
             pdf_path=pdf_path,
             month=month,
@@ -611,14 +577,96 @@ class DocumentProcessingService:
             planned_name=planned_path.name,
             planned_path=planned_path,
             planned_action=PlannedAction.MANUAL_REVIEW,
-            performed_action=performed_action,
             review_item=review_item,
             warnings=tuple(dict.fromkeys(warnings)),
             ocr_status=getattr(extraction, "ocr_status", None),
+            actual_path=pdf_path,
+        )
+
+    def _execute_plan(self, plan: ProcessingResult) -> ProcessingResult:
+        """Execute a complete plan, retaining it even after an action fails."""
+
+        target = plan.planned_path
+        actual_path = plan.pdf_path
+        performed_action = PerformedAction.NONE
+        try:
+            if target is None:
+                raise ValueError("Geplanter Zielpfad fehlt.")
+            if plan.planned_action == PlannedAction.RENAME:
+                if not self.renamer.rename_file(plan.pdf_path, target):
+                    raise OSError(f"Datei konnte nicht in {target.name} umbenannt werden.")
+                actual_path = target
+                performed_action = PerformedAction.RENAMED
+            elif plan.planned_action == PlannedAction.MANUAL_REVIEW:
+                if plan.review_item is None:
+                    raise ValueError("Geplanter Warteschlangeneintrag fehlt.")
+                if self.review_store.load_error:
+                    raise OSError(self.review_store.load_error)
+                previous_items = self.review_store.get_all()
+                if not self.renamer.move_file(plan.pdf_path, target):
+                    raise OSError(
+                        f"Datei konnte nicht nach {target.parent.name} verschoben werden."
+                    )
+                actual_path = target
+                performed_action = PerformedAction.MOVED_TO_REVIEW
+                try:
+                    self.review_store.add(plan.review_item)
+                    if not self.review_store.save():
+                        raise OSError("unbekannter Speicherfehler")
+                except Exception as queue_error:
+                    # Include add() failures as well as save() failures in the
+                    # compensation. Neither may leave a PDF without an entry.
+                    self.review_store.items = previous_items
+                    rollback_error = None
+                    try:
+                        rolled_back = self.renamer.move_file(target, plan.pdf_path)
+                    except Exception as error:
+                        rolled_back = False
+                        rollback_error = str(error) or error.__class__.__name__
+                    if rolled_back:
+                        actual_path = plan.pdf_path
+                        performed_action = PerformedAction.NONE
+                        raise OSError(
+                            "Warteschlange konnte nicht gespeichert werden; die PDF wurde "
+                            f"an ihren Ausgangsort zurückverschoben ({queue_error})."
+                        ) from queue_error
+
+                    # Keep a recovery entry available for the batch save retry,
+                    # even if add() raised before inserting it into the store.
+                    self.review_store.items = [*previous_items, plan.review_item]
+                    detail = f"; Rückverschieben: {rollback_error}" if rollback_error else ""
+                    raise OSError(
+                        "Warteschlange konnte nicht gespeichert und die PDF nicht "
+                        f"zurückverschoben werden. Datei liegt unter: {target} "
+                        f"({queue_error}{detail})."
+                    ) from queue_error
+            else:
+                raise ValueError("Ausführbare Dateiaktion fehlt.")
+        except Exception as error:
+            if target is not None and actual_path == plan.pdf_path:
+                self._release_reservation(target)
+            return replace(
+                plan,
+                performed_action=(
+                    performed_action
+                    if performed_action != PerformedAction.NONE
+                    else PerformedAction.ERROR
+                ),
+                actual_path=actual_path,
+                failed_stage=ProcessingStage.ACTION,
+                error=str(error) or error.__class__.__name__,
+            )
+        return replace(
+            plan,
+            stages=(*plan.stages, ProcessingStage.ACTION),
+            performed_action=performed_action,
+            actual_path=actual_path,
         )
 
     @staticmethod
     def _review_path(base_folder: Path, planned_path: Path) -> str:
+        base_folder = Path(base_folder).resolve()
+        planned_path = Path(planned_path).resolve()
         try:
             return str(planned_path.relative_to(base_folder))
         except ValueError:

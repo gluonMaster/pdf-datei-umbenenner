@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 
@@ -311,3 +312,288 @@ def test_header_migration_creates_backup_and_keeps_data(tmp_path):
         "Nummer;Nachname;Vorname"
     )
     assert StudentRegistry(csv_path).match("Doe Jane").status == MatchStatus.EXACT
+
+
+@pytest.mark.parametrize("operation", ["add", "edit", "merge"])
+def test_canonical_write_cannot_conflict_with_confirmed_alias(tmp_path, operation):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Canonical", "Jane"), (2, "Other", "Ada")])
+    registry = StudentRegistry(csv_path)
+    registry.confirm_existing("OCR Jane", 1)
+    original = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    with pytest.raises(RegistryValidationError, match="Alias"):
+        if operation == "add":
+            registry.confirm_new("OCR", "Jane", active=False)
+        elif operation == "edit":
+            registry.update_student(2, last_name="Jane", first_name="OCR", active=False)
+        else:
+            registry.merge_students([registry_module.Student(3, "OCR", "Jane", False)])
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == original
+    assert registry.match("OCR Jane").student.number == 1
+    assert StudentRegistry(csv_path).is_available
+
+
+@pytest.mark.parametrize("bad_number", [True, False, 1.0, 1.9, float("inf"), None, "1.5", 0, -1])
+def test_confirmation_rejects_invalid_student_number_without_writing(tmp_path, bad_number):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    original = csv_path.read_bytes()
+    registry = StudentRegistry(csv_path)
+
+    with pytest.raises(RegistryValidationError):
+        registry.confirm_existing("D0e Jane", bad_number)
+
+    assert csv_path.read_bytes() == original
+    assert not registry.aliases_path.exists()
+    assert registry.select_existing(" 1 ").number == 1
+
+
+@pytest.mark.parametrize("payload", [
+    '{"aliases": [{"name": "OCR Name", "student_number": true}]}',
+    '{"aliases": [{"name": "OCR Name", "student_number": 1.9}]}',
+    '{"aliases": [{"name": "OCR Name", "student_number": 1e999}]}',
+    '{"aliases": {"OCR Name": 1, "OCR Name": 2}}',
+    '{"aliases": {}, "aliases": []}',
+    '{"version": true, "aliases": []}',
+    '{"version": 1}',
+    '{"aliases": {"OCR Name": 99}}',
+    '{"aliases": {"OCR Name": 1, " ocr  name ": 2}}',
+    '{"aliases": {"Doe Jane": 2}}',
+])
+def test_damaged_alias_data_requires_review_and_is_not_rewritten(tmp_path, payload):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane"), (2, "Roe", "Ada")])
+    aliases_path = tmp_path / "student_aliases.json"
+    aliases_path.write_text(payload, encoding="utf-8")
+
+    registry = StudentRegistry(csv_path)
+
+    assert registry.match("Doe Jane").status == MatchStatus.ERROR
+    assert registry.match_parts("Doe", "Jane").requires_manual_review
+    assert registry.match_parts("", "").status == MatchStatus.ERROR
+    assert aliases_path.read_text(encoding="utf-8") == payload
+
+
+def test_match_parts_preserves_field_boundaries_and_raw_name_handles_both_orders(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Martin", "Thomas"), (2, "Thomas", "Martin"),
+                          (3, "Van Sample", "Ada"), (4, "Van", "Sample Ada")])
+    registry = StudentRegistry(csv_path)
+
+    assert registry.match("Martin Thomas").status == MatchStatus.AMBIGUOUS
+    assert registry.match_parts(" MARTIN ", " thomas ").student.number == 1
+    assert registry.match_parts("Thomas", "Martin").student.number == 2
+    assert registry.match_parts("Van Sample", "Ada").student.number == 3
+    assert registry.match_parts("Van", "Sample Ada").student.number == 4
+    assert registry.match_parts("Ada", "Van Sample").status != MatchStatus.EXACT
+
+
+def test_fuzzy_ambiguity_does_not_depend_on_display_limit(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(2, "Sample", "Anna"), (1, "Sample", "Anne")])
+    registry = StudentRegistry(csv_path, suggestion_limit=1)
+
+    match = registry.match("Sample Anni")
+
+    assert match.status == MatchStatus.AMBIGUOUS
+    assert match.student is None
+    assert [item.number for item in match.suggestions] == [1]
+
+
+def test_unicode_equivalence_and_confirmed_alias_survive_edit_and_reload(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(4, "Mu\u0308ller", "E\u0301va")])
+    registry = StudentRegistry(csv_path)
+    original_csv = csv_path.read_bytes()
+    assert registry.match("Éva MÜLLER").student.number == 4
+    registry.confirm_existing("Mueller Eva", 4, save_alias=False)
+    assert not registry.aliases_path.exists()
+    registry.confirm_existing("Mueller Eva", 4)
+    original_aliases = registry.aliases_path.read_bytes()
+    registry.confirm_existing("  MUELLER  eva ", 4)
+    assert registry.aliases_path.read_bytes() == original_aliases
+    assert csv_path.read_bytes() == original_csv
+
+    registry.update_student(4, last_name="Neu-Müller", active=False)
+
+    match = StudentRegistry(csv_path).match("Mueller Eva")
+    assert match.student.number == 4
+    assert match.student.full_name == "Neu-Müller Éva"
+    assert match.student.active is False
+
+
+def test_unknown_and_noop_edits_do_not_rewrite_csv_or_aliases(tmp_path, monkeypatch):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, " Same ", " Name "), (2, "Same", "Name")])
+    registry = StudentRegistry(csv_path)
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("Read-only or unchanged operation attempted a write")
+
+    monkeypatch.setattr(registry, "_atomic_write_bytes", unexpected_write)
+    assert registry.match("Unknown Person").student is None
+    assert registry.select_existing(1).number == 1
+    assert registry.update_student(1).number == 1
+    assert registry.update_student(1, last_name=" Same ", active=True).number == 1
+
+
+def test_duplicate_names_can_be_marked_inactive_without_deletion(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Same", "Name"), (2, "Same", "Name")])
+    registry = StudentRegistry(csv_path)
+
+    registry.update_student(2, active=False)
+
+    match = StudentRegistry(csv_path).match("Same Name")
+    assert match.status == MatchStatus.AMBIGUOUS
+    assert [item.active for item in match.suggestions] == [True, False]
+
+
+@pytest.mark.parametrize("bom", [True, False])
+def test_csv_writes_preserve_extra_columns_header_order_and_encoding(tmp_path, bom):
+    csv_path = tmp_path / "Schuler.csv"
+    csv_path.write_text(
+        'Notiz;Forname;Nummer;Nachname\n"keep; this";Jane;5;Doe\n',
+        encoding="utf-8-sig" if bom else "utf-8",
+    )
+    registry = StudentRegistry(csv_path)
+    registry.update_student(5, first_name="Janet")
+    registry.confirm_new("New", "Ada", active=False)
+    before_migration = csv_path.read_bytes()
+
+    backup = registry.migrate_to_vorname_header()
+
+    assert backup.read_bytes() == before_migration
+    assert csv_path.read_bytes().startswith(b"\xef\xbb\xbf") == bom
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=";")
+        rows = list(reader)
+    assert reader.fieldnames == ["Notiz", "Vorname", "Nummer", "Nachname", "Aktiv"]
+    assert rows[0] == {"Notiz": "keep; this", "Vorname": "Janet", "Nummer": "5",
+                       "Nachname": "Doe", "Aktiv": "1"}
+    assert rows[1]["Notiz"] == ""
+    assert StudentRegistry(csv_path).match("New Ada").student.number == 6
+
+
+@pytest.mark.parametrize("contents", [
+    b"", b"\xff\xfeinvalid", b"Nummer;Nachname;Vorname\n",
+    b"Nummer;Nachname;Vorname;Aktiv\n1;Doe;Jane\n",
+    b"Nummer;Nachname;Vorname;Aktiv\n1;Doe;Jane;maybe\n",
+    b"Nummer;Nachname;Vorname\n1;Doe;Jane;extra\n",
+    b"Nummer;Nachname;Vorname\n1;D\x00oe;Jane\n",
+    b"Nummer;Nachname;Vorname;Forname\n1;Doe;Jane;Janet\n",
+    b"Nummer;Nachname;Vorname;Vorname\n1;Doe;Jane;Jane\n",
+    b"Nummer;Nachname;Vorname;\n1;Doe;Jane;note\n",
+])
+def test_malformed_csv_returns_error_without_mutating_file(tmp_path, contents):
+    csv_path = tmp_path / "Schuler.csv"
+    csv_path.write_bytes(contents)
+    registry = StudentRegistry(csv_path)
+
+    assert registry.match("Doe Jane").status == MatchStatus.ERROR
+    with pytest.raises(registry_module.RegistryUnavailableError):
+        registry.confirm_new("New", "Student")
+    assert csv_path.read_bytes() == contents
+
+
+def test_agreeing_first_name_headers_are_kept_in_sync(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    csv_path.write_text("Nummer;Nachname;Forname;Vorname\n1;Doe;Jane; JANE \n", encoding="utf-8")
+    registry = StudentRegistry(csv_path)
+    registry.update_student(1, first_name="Janet")
+
+    assert StudentRegistry(csv_path).match("Doe Janet").status == MatchStatus.EXACT
+    assert csv_path.read_text(encoding="utf-8").splitlines()[1] == "1;Doe;Janet;Janet"
+
+
+def test_legacy_alias_migration_is_backed_up_once(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    aliases_path = tmp_path / "student_aliases.json"
+    aliases_path.write_text('{"aliases": {"OCR Jane": "1"}}', encoding="utf-8-sig")
+    original = aliases_path.read_bytes()
+    registry = StudentRegistry(csv_path)
+
+    registry.confirm_existing("D0e Jane", 1)
+    registry.confirm_existing("Doo Jane", 1)
+
+    backups = list(tmp_path.glob("student_aliases.json.bak*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert StudentRegistry(csv_path).match("OCR Jane").student.number == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["mkstemp", "fsync"])
+@pytest.mark.parametrize("target", ["csv", "aliases"])
+def test_atomic_write_setup_or_flush_failure_is_controlled(tmp_path, monkeypatch, failure_stage, target):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    registry = StudentRegistry(csv_path)
+    original = csv_path.read_bytes()
+
+    def fail(*args, **kwargs):
+        raise OSError("simulated write failure")
+
+    owner = registry_module.tempfile if failure_stage == "mkstemp" else registry_module.os
+    monkeypatch.setattr(owner, failure_stage, fail)
+    with pytest.raises(RegistryWriteError):
+        if target == "csv":
+            registry.confirm_new("New", "Ada")
+        else:
+            registry.confirm_existing("D0e Jane", 1)
+
+    assert csv_path.read_bytes() == original
+    assert len(registry.students) == 1
+    assert not registry.aliases_path.exists()
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_backup_failure_prevents_schema_migration(tmp_path, monkeypatch):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    registry = StudentRegistry(csv_path)
+    original = csv_path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("simulated backup failure")
+
+    monkeypatch.setattr(registry_module.os, "replace", fail_replace)
+    with pytest.raises(RegistryWriteError):
+        registry.update_student(1, active=False)
+
+    assert csv_path.read_bytes() == original
+    assert registry.select_existing(1).active is True
+    assert list(tmp_path.iterdir()) == [csv_path]
+
+
+def test_bulk_write_always_creates_backup_and_normalizes_new_rows(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    registry = StudentRegistry(csv_path)
+    original = csv_path.read_bytes()
+
+    backup = registry.merge_students([
+        registry_module.Student(5, "  New  Name  ", " Ada "),
+        registry_module.Student(7, "Other", "Janet"),
+    ], create_backup=False)
+
+    assert backup.read_bytes() == original
+    assert registry.select_existing(5).full_name == "New Name Ada"
+    assert registry.confirm_new("Next", "Student").number == 8
+
+
+def test_failed_reload_discards_stale_matches_and_can_recover(tmp_path):
+    csv_path = tmp_path / "Schuler.csv"
+    _write_csv(csv_path, [(1, "Doe", "Jane")])
+    registry = StudentRegistry(csv_path)
+    original = csv_path.read_bytes()
+    csv_path.write_bytes(b"invalid")
+
+    assert registry.reload() is False
+    assert registry.match("Doe Jane").status == MatchStatus.ERROR
+    assert registry.students == ()
+    csv_path.write_bytes(original)
+    assert registry.reload() is True
+    assert registry.match("Doe Jane").status == MatchStatus.EXACT

@@ -26,6 +26,7 @@ class FileRenamer:
         # reservation is made during planning, including dry-runs, so two
         # documents can never receive the same planned target.
         self._reserved_paths: Set[str] = set()
+        self._initial_folder_entries: Dict[str, Set[str]] = {}
     
     @staticmethod
     def sanitize_filename(name: str) -> str:
@@ -140,6 +141,7 @@ class FileRenamer:
         """Start a new batch of collision planning."""
 
         self._reserved_paths.clear()
+        self._initial_folder_entries.clear()
 
     def release_target_path(self, target_path: Path) -> None:
         """Release a failed real-operation reservation for deterministic retry."""
@@ -160,6 +162,21 @@ class FileRenamer:
         """
 
         desired_path = Path(desired_path)
+        folders = [desired_path.parent]
+        if source_path is not None:
+            folders.append(Path(source_path).parent)
+        for folder in folders:
+            folder_key = self._path_key(folder)
+            if folder_key not in self._initial_folder_entries:
+                # Snapshot both folders before the first move. Names vacated
+                # later remain occupied for the rest of the batch, giving
+                # dry-runs and real runs the same deterministic plan.
+                self._initial_folder_entries[folder_key] = (
+                    {self._path_key(entry) for entry in folder.iterdir()}
+                    if folder.exists()
+                    else set()
+                )
+        initial_entries = self._initial_folder_entries[self._path_key(desired_path.parent)]
         source_key = self._path_key(source_path) if source_path is not None else None
         counter = 0
         while True:
@@ -171,7 +188,11 @@ class FileRenamer:
                 )
             )
             candidate_key = self._path_key(candidate)
-            occupied_on_disk = candidate.exists() and candidate_key != source_key
+            occupied_on_disk = (
+                candidate_key in initial_entries
+                or candidate.exists()
+                or candidate.is_symlink()
+            ) and candidate_key != source_key
             if candidate_key not in self._reserved_paths and not occupied_on_disk:
                 self._reserved_paths.add(candidate_key)
                 self.processed_names.add(candidate.name)

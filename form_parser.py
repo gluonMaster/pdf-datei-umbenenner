@@ -1,7 +1,7 @@
 """Layout-aware parsing for legacy and attendance PDF forms."""
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import re
 import unicodedata
@@ -169,30 +169,52 @@ def _box_for(words: Sequence[PageWord]) -> BoundingBox:
 
 
 def _ordered_words(page: PageData) -> List[PageWord]:
-    return sorted(page.words, key=lambda word: (word.top, word.x0))
+    return [word for row in _group_rows(page.words, page.height) for word in row]
+
+
+def _anchor_parts(value: str) -> List[str]:
+    # Keep punctuation boundaries, including a suffix such as
+    # "Lehrkraft(Druckbuchstaben)", without requiring OCR word boundaries.
+    return [_normalized_key(part) for part in re.findall(r"[^\W_]+", value)]
+
+
+def _anchor_spans(parts: Sequence[str], label: str) -> Iterable[Tuple[int, int]]:
+    target = _normalized_key(label)
+    for start in range(len(parts)):
+        combined = ""
+        for end in range(start, len(parts)):
+            combined += parts[end]
+            if combined == target:
+                yield start, end + 1
+                break
+            if not target.startswith(combined):
+                break
+
+
+def _find_anchors(page: PageData, label: str) -> List[AnchorMatch]:
+    """Locate an anchor even when OCR has split one of its words."""
+
+    matches: List[AnchorMatch] = []
+    for row in _group_rows(page.words, page.height):
+        parts = [(part, word) for word in row for part in _anchor_parts(word.text)]
+        for start, end in _anchor_spans([part for part, _ in parts], label):
+            selected = tuple(dict.fromkeys(word for _, word in parts[start:end]))
+            # Do not join unrelated labels across separate columns.
+            if any(
+                right.x0 - left.x1 > page.width * 0.04
+                for left, right in zip(selected, selected[1:])
+            ):
+                continue
+            matches.append(AnchorMatch(label, _box_for(selected), selected))
+    return matches
 
 
 def _find_anchor(page: PageData, label: str) -> Optional[AnchorMatch]:
-    """Locate an anchor even when OCR has split one of its words."""
-
-    target = _normalized_key(label)
-    words = [word for word in _ordered_words(page) if _normalized_key(word.text)]
-
-    for start in range(len(words)):
-        combined = ""
-        selected: List[PageWord] = []
-        for word in words[start:start + 12]:
-            combined += _normalized_key(word.text)
-            selected.append(word)
-            if combined == target:
-                return AnchorMatch(label, _box_for(selected), tuple(selected))
-            if len(combined) >= len(target) or not target.startswith(combined):
-                break
-    return None
+    return next(iter(_find_anchors(page, label)), None)
 
 
 def _group_rows(words: Iterable[PageWord], page_height: float) -> List[List[PageWord]]:
-    tolerance = max(2.0, page_height * 0.004)
+    tolerance = page_height * 0.004
     rows: List[List[PageWord]] = []
     row_tops: List[float] = []
     for word in sorted(words, key=lambda item: (item.top, item.x0)):
@@ -225,16 +247,22 @@ class FormDetector:
     )
 
     def detect(self, page: PageData) -> FormDetection:
-        normalized_text = _normalized_key(page.text)
+        text_parts = _anchor_parts(page.text)
+
+        def has_anchor(label: str) -> bool:
+            return bool(_find_anchor(page, label)) or next(
+                iter(_anchor_spans(text_parts, label)), None
+            ) is not None
+
         attendance = tuple(
             anchor
             for anchor in self.ATTENDANCE_ANCHORS
-            if _normalized_key(anchor) in normalized_text
+            if has_anchor(anchor)
         )
         legacy = tuple(
             anchor
             for anchor in self.LEGACY_ANCHORS
-            if _normalized_key(anchor) in normalized_text
+            if has_anchor(anchor)
         )
 
         if len(attendance) >= 3:
@@ -271,9 +299,10 @@ class LegacyFormParser:
     """Preserve the successful parser behavior for the old top-line form."""
 
     def parse(self, page: PageData, detection: FormDetection) -> FormParseResult:
-        name = TextParser.extract_student_name(page.text)
-        subject = TextParser.extract_subject(page.text)
-        raw_subject = self._raw_subject(page.text)
+        header = self._header_text(page.text)
+        name = TextParser.extract_student_name(header)
+        subject = TextParser.extract_subject(header)
+        raw_subject = self._raw_subject(header)
         reasons = list(detection.reasons)
         warnings: List[str] = []
 
@@ -306,6 +335,19 @@ class LegacyFormParser:
             name_confidence=name_confidence,
             subject_confidence=subject_confidence,
         )
+
+    @staticmethod
+    def _header_text(text: str) -> str:
+        lines = []
+        for line in text.splitlines():
+            key = _normalized_key(line)
+            if any(
+                key.startswith(_normalized_key(label))
+                for label in FormDetector.LEGACY_ANCHORS
+            ):
+                break
+            lines.append(line)
+        return "\n".join(lines)
 
     @staticmethod
     def _raw_subject(text: str) -> Optional[str]:
@@ -369,6 +411,15 @@ class AttendanceFormParser:
             warnings.append("Strukturanker 'Name des Schülers' nicht lokalisiert.")
             return None
 
+        if birth_anchor is None:
+            warnings.append("Strukturanker 'Geburtsdatum' fehlt; rechte Namensgrenze geschätzt.")
+        elif (
+            birth_anchor.box.x0 <= name_anchor.box.x1
+            or abs(birth_anchor.box.top - name_anchor.box.top) > page.height * 0.025
+        ):
+            warnings.append("Strukturanker 'Geburtsdatum' liegt nicht neben dem Namensfeld.")
+            return None
+
         right_edge = (
             birth_anchor.box.x0 - page.width * 0.01
             if birth_anchor is not None
@@ -413,6 +464,8 @@ class AttendanceFormParser:
         excluded = {
             "name", "des", "schulers", "geburtsdatum", "hiermit", "wird",
             "fur", "folgenden", "schuler", "lehrkraft", "druckbuchstaben",
+            "formular", "anwesenheitsnachweis", "unterschrift", "firma",
+            "anbieter", "erziehungsberechtigten",
         }
         if any(_normalized_key(token) in excluded for token in tokens):
             return None
@@ -424,14 +477,43 @@ class AttendanceFormParser:
         reasons: List[str],
         warnings: List[str],
     ) -> Tuple[Optional[str], Optional[str]]:
-        subject_anchor = _find_anchor(page, self.SUBJECT_ANCHOR)
-        duration_anchor = _find_anchor(page, self.DURATION_ANCHOR)
-        location_anchor = _find_anchor(page, self.LOCATION_ANCHOR)
-        teacher_anchor = _find_anchor(page, self.TEACHER_ANCHOR)
-
-        if subject_anchor is None:
+        subject_anchors = _find_anchors(page, self.SUBJECT_ANCHOR)
+        if not subject_anchors:
             warnings.append("Strukturanker 'Fach' nicht lokalisiert.")
             return None, None
+
+        def neighbor(
+            subject_anchor: AnchorMatch, label: str, left: bool,
+        ) -> Optional[AnchorMatch]:
+            candidates = [
+                anchor for anchor in _find_anchors(page, label)
+                if abs(anchor.box.top - subject_anchor.box.top) <= page.height * 0.025
+                and (
+                    anchor.box.center_x < subject_anchor.box.center_x if left
+                    else anchor.box.center_x > subject_anchor.box.center_x
+                )
+            ]
+            return min(
+                candidates,
+                key=lambda anchor: abs(anchor.box.center_x - subject_anchor.box.center_x),
+                default=None,
+            )
+
+        # Prefer the table header to an earlier mention of "Fach" in prose.
+        subject_anchor = max(
+            subject_anchors,
+            key=lambda anchor: sum((
+                neighbor(anchor, self.DURATION_ANCHOR, left=True) is not None,
+                neighbor(anchor, self.LOCATION_ANCHOR, left=False) is not None,
+            )),
+        )
+        duration_anchor = neighbor(subject_anchor, self.DURATION_ANCHOR, left=True)
+        location_anchor = neighbor(subject_anchor, self.LOCATION_ANCHOR, left=False)
+        teacher_anchor = next(
+            (anchor for anchor in _find_anchors(page, self.TEACHER_ANCHOR)
+             if anchor.box.top > subject_anchor.box.bottom),
+            None,
+        )
 
         center = subject_anchor.box.center_x
         if duration_anchor is not None:
@@ -450,6 +532,8 @@ class AttendanceFormParser:
             if teacher_anchor is not None
             else page.height * 0.88
         )
+        if teacher_anchor is None:
+            warnings.append("Strukturanker 'Name der Lehrkraft' fehlt; untere Fachgrenze geschätzt.")
         values = page.words_in_region(
             left,
             subject_anchor.box.bottom + page.height * 0.005,
@@ -458,14 +542,31 @@ class AttendanceFormParser:
         )
         catalog = self._subject_catalog()
         matches: List[Tuple[str, str]] = []
+        unknown_values: List[str] = []
         for row in _group_rows(values, page.height):
-            match = self._match_subject(row, catalog)
-            if match:
-                matches.append(match)
+            cell_matches = self._match_subjects(row, catalog)
+            if cell_matches:
+                # One vote per subject and row; repeated words in one cell must
+                # not outweigh independent table rows.
+                seen = set()
+                for raw, canonical in cell_matches:
+                    if canonical not in seen:
+                        matches.append((raw, canonical))
+                        seen.add(canonical)
+            else:
+                raw = " ".join(word.text for word in row).strip()
+                if any(char.isalpha() for char in raw):
+                    unknown_values.append(raw)
+
+        if unknown_values:
+            warnings.append(
+                "Unbekannte Fachwerte im Tabellenfeld: "
+                + ", ".join(sorted(set(unknown_values)))
+            )
 
         if not matches:
             warnings.append("Kein bekanntes Fach im Tabellenfeld 'Fach' gefunden.")
-            return None, None
+            return ", ".join(sorted(set(unknown_values))) or None, None
 
         canonical_counts = Counter(canonical for _, canonical in matches)
         most_common = canonical_counts.most_common()
@@ -474,7 +575,7 @@ class AttendanceFormParser:
             f"{name}={count}" for name, count in sorted(canonical_counts.items())
         )
 
-        if len(leaders) != 1:
+        if len(leaders) != 1 or most_common[0][1] * 2 <= sum(canonical_counts.values()):
             raw_values = ", ".join(sorted({raw for raw, _ in matches}))
             warnings.append(
                 f"Widersprüchliche Fächer ohne Mehrheit erkannt ({counts_text})."
@@ -506,19 +607,29 @@ class AttendanceFormParser:
         return catalog
 
     @staticmethod
-    def _match_subject(
+    def _match_subjects(
         row: Sequence[PageWord],
         catalog: Dict[str, str],
-    ) -> Optional[Tuple[str, str]]:
-        # Try the entire cell first so OCR splits such as "Deu tsch" are joined.
-        for length in range(min(4, len(row)), 0, -1):
-            for start in range(0, len(row) - length + 1):
-                selected = row[start:start + length]
-                raw = " ".join(word.text for word in selected).strip()
+    ) -> List[Tuple[str, str]]:
+        # Consume all matches, including several subjects in one cell. Joining
+        # arbitrary OCR fragments must not silently hide a conflicting value.
+        tokens = [
+            token for word in row for token in re.split(r"[/,;+]", word.text)
+            if token.strip()
+        ]
+        matches: List[Tuple[str, str]] = []
+        start = 0
+        while start < len(tokens):
+            for end in range(len(tokens), start, -1):
+                raw = " ".join(tokens[start:end]).strip()
                 canonical = catalog.get(_normalized_key(raw))
                 if canonical:
-                    return raw, canonical
-        return None
+                    matches.append((raw, canonical))
+                    start = end
+                    break
+            else:
+                start += 1
+        return matches
 
 
 class FormParser:
@@ -531,6 +642,7 @@ class FormParser:
 
     def parse(self, page: PageData) -> FormParseResult:
         detection = self.detector.detect(page)
+        detection = replace(detection, reasons=tuple(page.diagnostics) + detection.reasons)
         if detection.form_type == FormType.LEGACY:
             return self.legacy_parser.parse(page, detection)
         if detection.form_type == FormType.ATTENDANCE:

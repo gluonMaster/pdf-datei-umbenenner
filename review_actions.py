@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from file_renamer import FileRenamer
 from review_queue import ReviewItem, ReviewStore
-from student_registry import MatchStatus, Student, normalize_name
+from student_registry import Student, normalize_name
 
 
 class ReviewDecision(str, Enum):
@@ -165,13 +165,21 @@ class ReviewActionService:
                 int(year),
                 source_path=source_path,
             )
-            if not self.renamer.move_file(source_path, target_path):
+            try:
+                moved = self.renamer.move_file(source_path, target_path)
+            except Exception:
+                self._release_reservation(target_path)
+                raise
+            if not moved:
                 self._release_reservation(target_path)
                 raise OSError(f"PDF konnte nicht nach {target_path.name} verschoben werden.")
             file_moved = True
 
             if not self._remove_from_queue_safely(request.item.file_path):
-                rolled_back = self.renamer.move_file(target_path, source_path)
+                try:
+                    rolled_back = self.renamer.move_file(target_path, source_path)
+                except Exception:
+                    rolled_back = False
                 self._release_reservation(target_path)
                 if rolled_back:
                     file_moved = False
@@ -252,16 +260,17 @@ class ReviewActionService:
             )
 
     def _find_or_add_student(self, last_name: str, first_name: str) -> tuple[Student, bool]:
-        requested_key = normalize_name(f"{last_name} {first_name}")
+        requested_key = (normalize_name(last_name), normalize_name(first_name))
         canonical_matches = [
             item
             for item in getattr(self.student_registry, "students", ())
-            if normalize_name(item.full_name) == requested_key
+            if (normalize_name(item.last_name), normalize_name(item.first_name))
+            == requested_key
         ]
         if len(canonical_matches) == 1:
             # Makes a retry safe when the registry write succeeded but moving
             # the PDF failed during the preceding attempt.
-            return canonical_matches[0], False
+            return self.student_registry.select_existing(canonical_matches[0].number), False
         if len(canonical_matches) > 1:
             raise ValueError("Mehrere Schüler haben diesen Namen; bitte auswählen.")
 
@@ -270,10 +279,10 @@ class ReviewActionService:
 
     def _remove_from_queue_safely(self, file_path: str) -> bool:
         previous_items = self.review_store.get_all()
-        if not self.review_store.remove(file_path):
-            return False
         try:
-            saved = bool(self.review_store.save())
+            saved = bool(
+                self.review_store.remove(file_path) and self.review_store.save()
+            )
         except Exception:
             saved = False
         if saved:

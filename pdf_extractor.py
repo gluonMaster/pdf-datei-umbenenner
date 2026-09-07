@@ -13,17 +13,18 @@ class PDFExtractor:
     """Extract text and positioned elements from PDF files."""
 
     @staticmethod
-    def extract_page_data(pdf_path: Path) -> Optional[PageData]:
+    def extract_page_data(pdf_path: Path) -> PageData:
         """Extract complete text and positioned elements from the first page.
 
         Coordinates use pdfplumber's top-origin page coordinate system. Returning
         a structured page keeps layout-sensitive parsing independent of PDF file
-        names and of a fixed line limit.
+        names and of a fixed line limit. Unreadable/empty PDFs return diagnostic
+        pages so callers can pass the failure to manual review.
         """
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 if not pdf.pages:
-                    return None
+                    return PageData(0.0, 0.0, "", diagnostics=("PDF enthält keine Seiten.",))
 
                 page = pdf.pages[0]
                 text = page.extract_text() or ""
@@ -59,10 +60,15 @@ class PDFExtractor:
                     words=words,
                     characters=characters,
                     source=ExtractionSource.PDF_TEXT,
+                    diagnostics=() if text.strip() else (
+                        "Keine lesbare Textebene auf der ersten PDF-Seite.",
+                    ),
                 )
         except Exception as error:
-            print(f"Fehler beim Lesen der Datei {pdf_path.name}: {error}")
-            return None
+            return PageData(
+                0.0, 0.0, "",
+                diagnostics=(f"Fehler beim Lesen der PDF ({error.__class__.__name__}): {error}",),
+            )
 
     @classmethod
     def extract_text(cls, pdf_path: Path) -> Optional[str]:
@@ -74,7 +80,7 @@ class PDFExtractor:
         return page_data.text
 
     @classmethod
-    def extract_first_page(cls, pdf_path: Path) -> Optional[PageData]:
+    def extract_first_page(cls, pdf_path: Path) -> PageData:
         """Compatibility alias for the structured first-page API."""
 
         return cls.extract_page_data(pdf_path)
@@ -171,7 +177,7 @@ class OCRFallbackExtractor:
             )
         return replace(
             page,
-            diagnostics=tuple(page.diagnostics) + (diagnostic,),
+            diagnostics=(diagnostic,) + tuple(page.diagnostics),
             ocr_status=result.status.value,
         )
 

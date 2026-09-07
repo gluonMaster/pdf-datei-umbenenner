@@ -1,5 +1,9 @@
 """Synthetic tests for layout-aware old and new form parsing."""
 
+from dataclasses import replace
+
+import pytest
+
 from form_parser import FormDetector, FormParser, FormType
 from page_data import ExtractionSource, PageCharacter, PageData, PageWord
 from pdf_extractor import PDFExtractor
@@ -116,7 +120,7 @@ def test_detector_accepts_attendance_form_with_one_missing_anchor():
         width=page.width,
         height=page.height,
         text=page.text.replace("Anwesenheitsnachweis", "Nachweis"),
-        words=page.words,
+        words=tuple(word for word in page.words if word.text != "Anwesenheitsnachweis"),
     )
 
     detection = FormDetector().detect(page)
@@ -218,3 +222,209 @@ def test_unknown_form_has_diagnostics_for_manual_review():
     assert result.requires_review
     assert result.reasons
     assert result.warnings
+
+
+def test_complete_first_page_is_parsed_beyond_ten_lines(monkeypatch, tmp_path):
+    page = _attendance_page()
+    page = replace(page, text="\n".join(["Form header"] * 12 + [page.text]))
+    monkeypatch.setattr(PDFExtractor, "extract_page_data", lambda _path: page)
+
+    path = tmp_path / "arbitrary-file-name.pdf"
+    assert "Fach" not in PDFExtractor.extract_first_lines(path)
+    assert "Fach" in PDFExtractor.extract_text(path)
+    result = FormParser().parse(PDFExtractor.extract_first_page(path))
+    assert result.student_name == "Sample Student"
+    assert result.subject == "Deutsch"
+
+
+@pytest.mark.parametrize("scale", [0.2, 1.0, 3.0])
+def test_positioned_anchors_tolerate_baseline_jitter_and_word_breaks(scale):
+    page = _attendance_page(scale=scale, split_anchors=True)
+    words = [
+        replace(word, top=word.top + (index % 3) * scale,
+                bottom=word.bottom + (index % 3) * scale)
+        for index, word in enumerate(page.words)
+    ]
+    # Detection and parsing work from word coordinates even without flat text.
+    result = FormParser().parse(replace(page, words=words, text=""))
+
+    assert result.student_name == "Sample Student"
+    assert result.subject == "Deutsch"
+    assert not result.requires_review
+
+
+def test_punctuation_suffix_on_teacher_anchor_stops_subject_collection():
+    page = _attendance_page()
+    words = [word for word in page.words if word.top < 710]
+    words += _line("Name derLehrkraft(Druckbuchstaben)", 40, 500)
+    words += _line("Unrelated Adult", 350, 500)
+    for top in (530, 550, 570, 590):
+        words += _line("Englisch", 238, top)
+
+    result = FormParser().parse(replace(page, words=words))
+
+    assert result.subject == "Deutsch"
+    assert not result.requires_review
+
+
+@pytest.mark.parametrize("missing", ["Geburtsdatum", "Dauer", "Ort", "Name der Lehrkraft"])
+def test_missing_region_boundary_is_reported(missing):
+    page = _attendance_page()
+    if missing == "Name der Lehrkraft":
+        words = [word for word in page.words if word.top != 710]
+    else:
+        words = [word for word in page.words if word.text != missing]
+
+    result = FormParser().parse(replace(page, text=page.text.replace(missing, ""), words=words))
+
+    assert result.student_name == "Sample Student"
+    assert result.subject == "Deutsch"
+    assert result.requires_review
+    assert any(f"'{missing}'" in warning for warning in result.warnings)
+
+
+def test_neighbor_anchors_must_belong_to_table_header():
+    page = _attendance_page()
+    # Earlier unrelated mentions must not supply the table's column boundaries.
+    extra = _line("Dauer", 20, 250) + _line("Ort", 500, 250)
+    result = FormParser().parse(replace(page, words=list(page.words) + extra))
+
+    assert result.subject == "Deutsch"
+    assert not result.requires_review
+
+
+def test_subject_anchor_is_selected_from_table_header():
+    page = _attendance_page()
+    words = list(page.words) + _line("Fach", 40, 240)
+    result = FormParser().parse(replace(page, words=words))
+
+    assert result.subject == "Deutsch"
+    assert not result.requires_review
+
+
+@pytest.mark.parametrize("missing", ["Name des Schülers", "Fach"])
+def test_missing_field_anchor_requires_review_without_teacher_fallback(missing):
+    page = _attendance_page()
+    words = [
+        word for word in page.words
+        if not (word.top == 155 and word.x0 < 360 if missing == "Name des Schülers"
+                else word.text == "Fach")
+    ]
+    result = FormParser().parse(replace(page, words=words, text=page.text.replace(missing, "")))
+
+    assert result.form_type == FormType.ATTENDANCE
+    assert result.requires_review
+    assert any(f"'{missing}'" in warning for warning in result.warnings)
+    if missing == "Fach":
+        assert result.subject is None
+    else:
+        assert result.student_name is None
+
+
+def test_subject_plurality_without_strict_majority_requires_review():
+    result = FormParser().parse(_attendance_page(subjects=["Deutsch", "Deutsch", "Englisch", "Mathe"]))
+
+    assert result.subject is None
+    assert result.requires_review
+    assert any("ohne Mehrheit" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize("cell", ["Deutsch Englisch", "Deutsch/Englisch"])
+def test_conflicting_subjects_in_one_cell_are_not_silently_discarded(cell):
+    page = _attendance_page(subjects=["Deutsch"])
+    words = [word for word in page.words if word.top != 370]
+    if "/" in cell:
+        words.append(PageWord(cell, 238, 370, 270, 380))
+    else:
+        words += [PageWord("Deutsch", 235, 370, 251, 380), PageWord("Englisch", 253, 370, 270, 380)]
+    result = FormParser().parse(replace(page, words=words))
+
+    assert result.subject is None
+    assert "Deutsch" in result.raw_subject and "Englisch" in result.raw_subject
+    assert result.requires_review
+
+
+def test_unknown_subject_evidence_is_preserved():
+    result = FormParser().parse(_attendance_page(subjects=["Testfach"]))
+
+    assert result.raw_subject == "Testfach"
+    assert result.subject is None
+    assert result.requires_review
+
+
+def test_known_subject_does_not_hide_unknown_rows():
+    result = FormParser().parse(_attendance_page(subjects=["Deutsch", "Deutsch", "Testfach"]))
+
+    assert result.subject == "Deutsch"
+    assert result.requires_review
+    assert any("Testfach" in warning for warning in result.warnings)
+
+
+def test_date_and_service_labels_cannot_become_student_name():
+    page = _attendance_page()
+    words = [word for word in page.words if word.top != 140]
+    words += _line("Name des Schülers", 40, 140)
+    words += _line("01.01.2015", 360, 140)
+
+    result = FormParser().parse(replace(page, words=words))
+
+    assert result.student_name is None
+    assert result.requires_review
+
+
+def test_birth_date_is_excluded_from_positioned_student_name():
+    page = _attendance_page()
+    words = list(page.words) + _line("01.01.2015", 360, 140)
+    result = FormParser().parse(replace(page, words=words))
+
+    assert result.student_name == "Sample Student"
+    assert not result.requires_review
+
+
+def test_legacy_parser_cannot_take_missing_student_fields_from_teacher():
+    page = PageData(595, 842, "Lehrer(in):\nUnrelated Adult Deutsch\nMonat Januar\nUnterrichtsart")
+
+    result = FormParser().parse(page)
+
+    assert result.form_type == FormType.LEGACY
+    assert result.student_name is None
+    assert result.subject is None
+    assert result.requires_review
+
+
+def test_anchor_substrings_do_not_classify_unrelated_document():
+    text = "Anwesenheitsnachweis Name des Schülers Fachberatung Lehrkraftplanung"
+    result = FormParser().parse(PageData(595, 842, text))
+
+    assert result.form_type == FormType.UNKNOWN
+
+
+def test_pdf_read_failure_has_structured_diagnostics(tmp_path):
+    path = tmp_path / "broken.pdf"
+    path.write_bytes(b"not a PDF")
+
+    page = PDFExtractor.extract_page_data(path)
+    result = FormParser().parse(page)
+
+    assert page.diagnostics
+    assert any("Fehler beim Lesen" in reason for reason in result.reasons)
+    assert result.requires_review
+    assert PDFExtractor.extract_text(path) is None
+    assert PDFExtractor.extract_first_lines(path) is None
+
+
+def test_pdf_with_no_pages_has_structured_diagnostics(monkeypatch, tmp_path):
+    class EmptyPdf:
+        pages = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr("pdf_extractor.pdfplumber.open", lambda _path: EmptyPdf())
+    page = PDFExtractor.extract_page_data(tmp_path / "empty.pdf")
+
+    assert "keine Seiten" in page.diagnostics[0]
+    assert FormParser().parse(page).requires_review
