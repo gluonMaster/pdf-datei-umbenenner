@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-import hashlib
 import io
 from pathlib import Path
 from typing import Optional, Tuple
@@ -17,6 +16,7 @@ from student_registry import (
     StudentRegistry,
     _clean_display,
     _parse_active,
+    _parse_student_number,
     normalize_name,
 )
 
@@ -157,13 +157,18 @@ class StudentRegistryService:
     ) -> Tuple[DuplicateCandidate, ...]:
         if not 0.0 <= threshold <= 1.0:
             raise ValueError("Der Schwellenwert muss zwischen 0 und 1 liegen.")
+        self.registry.checked_fingerprint()
         students = sorted(self.registry.students, key=lambda item: item.number)
+        keys = {student.number: normalize_name(student.full_name) for student in students}
         result = []
         for index, first in enumerate(students):
-            first_key = normalize_name(first.full_name)
+            first_key = keys[first.number]
             for second in students[index + 1 :]:
-                second_key = normalize_name(second.full_name)
-                score = SequenceMatcher(None, first_key, second_key).ratio()
+                second_key = keys[second.number]
+                matcher = SequenceMatcher(None, first_key, second_key)
+                if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+                    continue
+                score = matcher.ratio()
                 if score < threshold:
                     continue
                 reason = "Gleicher normalisierter Name" if score == 1.0 else "Ähnliche Namen"
@@ -178,6 +183,7 @@ class StudentRegistryService:
         """Parse an external UTF-8 CSV and calculate a non-mutating diff."""
 
         path = Path(source_path)
+        base_fingerprint = self._registry_fingerprint()
         imported_rows, delimiter = self._read_import(path)
         imported_numbers = {row.student.number for row in imported_rows}
         number_counts: dict[int, int] = {}
@@ -268,6 +274,10 @@ class StudentRegistryService:
                 key=lambda item: item.number,
             )
         )
+        if base_fingerprint != self._registry_fingerprint():
+            raise RegistryValidationError(
+                "Das Schülerverzeichnis wurde während der Vorschau geändert; bitte erneut prüfen."
+            )
         return ImportPreview(
             source_path=path.resolve(),
             delimiter=delimiter,
@@ -277,7 +287,7 @@ class StudentRegistryService:
             conflicts=tuple(conflicts),
             duplicates=tuple(duplicates),
             missing=missing,
-            base_fingerprint=self._registry_fingerprint(),
+            base_fingerprint=base_fingerprint,
         )
 
     def apply_import(
@@ -306,13 +316,7 @@ class StudentRegistryService:
         )
 
     def _registry_fingerprint(self) -> str:
-        try:
-            data = self.registry.csv_path.read_bytes()
-        except OSError as exc:
-            raise RegistryValidationError(
-                f"Schülerverzeichnis kann nicht gelesen werden: {self.registry.csv_path}"
-            ) from exc
-        return hashlib.sha256(data).hexdigest()
+        return self.registry.checked_fingerprint()
 
     @staticmethod
     def _name_key(student: Student) -> tuple[str, str]:
@@ -337,11 +341,15 @@ class StudentRegistryService:
 
         delimiter = StudentRegistryService._detect_delimiter(text)
         reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
-        if reader.fieldnames is None:
+        try:
+            fieldnames = reader.fieldnames
+        except csv.Error as exc:
+            raise RegistryValidationError(f"Kopfzeile der Import-CSV ist fehlerhaft: {exc}") from exc
+        if fieldnames is None:
             raise RegistryValidationError("Kopfzeile der Import-CSV fehlt.")
 
         header_map: dict[str, str] = {}
-        for raw_header in reader.fieldnames:
+        for raw_header in fieldnames:
             clean_header = " ".join((raw_header or "").split())
             key = clean_header.casefold()
             if not key:
@@ -375,17 +383,15 @@ class StudentRegistryService:
                 values = ["" if value is None else str(value) for value in row.values()]
                 if not any(value.strip() for value in values):
                     continue
+                if any(value is None for value in row.values()):
+                    raise RegistryValidationError(f"Zeile {row_number} enthält zu wenige Felder.")
                 raw_number = row.get(header_map["nummer"], "")
                 try:
-                    number = int(str(raw_number).strip())
+                    number = _parse_student_number(raw_number)
                 except (TypeError, ValueError) as exc:
                     raise RegistryValidationError(
-                        f"Zeile {row_number}: Nummer muss eine Ganzzahl sein."
+                        f"Zeile {row_number}: Nummer muss eine positive Ganzzahl sein."
                     ) from exc
-                if number <= 0:
-                    raise RegistryValidationError(
-                        f"Zeile {row_number}: Nummer muss positiv sein."
-                    )
                 last_name = _clean_display(
                     row.get(header_map["nachname"], ""),
                     f"Zeile {row_number} Nachname",
@@ -394,6 +400,14 @@ class StudentRegistryService:
                     row.get(header_map[first_key], ""),
                     f"Zeile {row_number} {first_key}",
                 )
+                if "vorname" in header_map and "forname" in header_map:
+                    legacy_name = _clean_display(
+                        row[header_map["forname"]], f"Zeile {row_number} Forname"
+                    )
+                    if normalize_name(first_name) != normalize_name(legacy_name):
+                        raise RegistryValidationError(
+                            f"Zeile {row_number}: Forname und Vorname widersprechen sich."
+                        )
                 active_value = row.get(header_map["aktiv"]) if "aktiv" in header_map else None
                 imported.append(
                     _ImportRow(

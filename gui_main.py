@@ -52,6 +52,7 @@ class PDFRenamerGUI:
         self.selected_year = tk.IntVar(value=now.year)
         self.progress_var = tk.DoubleVar(value=0)
         self.processing = False
+        self._student_task_running = False
         self._close_requested = False
         self._active_batch_folder = None
         self._batch_queue_failed = False
@@ -396,7 +397,7 @@ class PDFRenamerGUI:
             ("Aliase", self.show_student_aliases),
             ("Duplikate suchen", self.show_student_duplicates),
             ("CSV importieren…", self.import_students_csv),
-            ("Aktualisieren", self.load_students_table),
+            ("Aktualisieren", self.reload_students),
         ):
             button = ttk.Button(buttons, text=text, command=command)
             button.pack(
@@ -408,6 +409,8 @@ class PDFRenamerGUI:
                 "Aktivieren / Deaktivieren",
                 "Aliase",
                 "CSV importieren…",
+                "Duplikate suchen",
+                "Aktualisieren",
             }:
                 self.student_mutation_buttons.append(button)
 
@@ -419,6 +422,9 @@ class PDFRenamerGUI:
         return {"Aktiv": True, "Inaktiv": False}.get(self.student_active_filter.get())
 
     def _ensure_idle(self) -> bool:
+        if getattr(self, "_student_task_running", False):
+            messagebox.showwarning("Schüler", "Bitte warten Sie, bis die Schülerliste geprüft oder gespeichert wurde.")
+            return False
         if not self.processing:
             return True
         messagebox.showwarning(
@@ -426,6 +432,68 @@ class PDFRenamerGUI:
             "Diese Änderung ist erst nach dem Batch-Ende möglich.",
         )
         return False
+
+    def _run_student_task(self, title, work, on_success):
+        """Run registry I/O/comparisons off Tk's thread; deliver results via after.
+
+        A modal progress window and the busy guard serialize registry changes
+        with review actions and PDF batches. The worker never calls Tkinter.
+        """
+        if not self._ensure_idle():
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(dialog, text=f"{title} …", padding=16).pack()
+        progress = ttk.Progressbar(dialog, mode="indeterminate", length=320)
+        progress.pack(padx=16, pady=(0, 16))
+        dialog.grab_set()
+        progress.start(20)
+        self._student_task_running = True
+        self._set_batch_controls(self.processing)
+        results = queue.Queue()
+
+        def run():
+            try:
+                results.put((work(), None))
+            except Exception as error:
+                results.put((None, error))
+
+        def finish(value, error):
+            progress.stop()
+            dialog.destroy()
+            self._student_task_running = False
+            self._set_batch_controls(self.processing)
+            if error is not None:
+                messagebox.showerror(title, str(error), parent=self.root)
+            else:
+                on_success(value)
+
+        def poll():
+            try:
+                value, error = results.get_nowait()
+            except queue.Empty:
+                self.root.after(50, poll)
+            else:
+                finish(value, error)
+
+        try:
+            self.student_task_thread = threading.Thread(target=run, daemon=True)
+            self.student_task_thread.start()
+        except Exception as error:
+            finish(None, error)
+            return
+        self.root.after(50, poll)
+
+    def reload_students(self):
+        def loaded(available):
+            self._after_student_change()
+            if not available:
+                messagebox.showerror("Schülerverzeichnis", self.student_registry.load_error)
+
+        self._run_student_task("Schülerliste aktualisieren", self.student_registry.reload, loaded)
 
     def load_students_table(self, _event=None):
         if not hasattr(self, "student_tree"):
@@ -621,6 +689,7 @@ class PDFRenamerGUI:
                 messagebox.showerror("Alias konnte nicht gelöscht werden", str(error), parent=dialog)
                 return
             refresh_aliases()
+            self._after_student_change(number)
 
         actions = ttk.Frame(dialog)
         actions.grid(row=1, column=0, sticky=tk.E, padx=10, pady=(0, 10))
@@ -631,7 +700,13 @@ class PDFRenamerGUI:
         refresh_aliases()
 
     def show_student_duplicates(self):
-        duplicates = self.student_admin.find_potential_duplicates()
+        self._run_student_task(
+            "Duplikate suchen",
+            self.student_admin.find_potential_duplicates,
+            self._show_student_duplicates,
+        )
+
+    def _show_student_duplicates(self, duplicates):
         if not duplicates:
             messagebox.showinfo("Duplikate", "Keine potenziellen Duplikate gefunden.")
             return
@@ -659,12 +734,10 @@ class PDFRenamerGUI:
         )
         if not source:
             return
-        try:
-            preview = self.student_admin.preview_import(source)
-        except Exception as error:
-            messagebox.showerror("CSV konnte nicht geprüft werden", str(error))
-            return
-        self._show_import_preview(preview)
+        self._run_student_task(
+            "CSV prüfen", lambda: self.student_admin.preview_import(source),
+            self._show_import_preview,
+        )
 
     def _show_import_preview(self, preview: ImportPreview):
         dialog = tk.Toplevel(self.root)
@@ -673,7 +746,7 @@ class PDFRenamerGUI:
         dialog.geometry("1000x600")
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(1, weight=1)
-        ttk.Label(dialog, text=preview.summary, font=("Arial", 10, "bold")).grid(
+        ttk.Label(dialog, text=f"{preview.source_path.name}\n{preview.summary}", font=("Arial", 10, "bold")).grid(
             row=0, column=0, sticky=tk.W, padx=10, pady=10
         )
         table = ttk.Frame(dialog)
@@ -681,30 +754,36 @@ class PDFRenamerGUI:
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
         scroll = ttk.Scrollbar(table, orient=tk.VERTICAL)
+        scroll_x = ttk.Scrollbar(table, orient=tk.HORIZONTAL)
         tree = ttk.Treeview(
             table,
-            columns=("category", "number", "last", "first", "detail"),
+            columns=("category", "number", "last", "first", "active", "detail"),
             show="headings",
             yscrollcommand=scroll.set,
+            xscrollcommand=scroll_x.set,
         )
         scroll.config(command=tree.yview)
+        scroll_x.config(command=tree.xview)
         for key, title, width in (
             ("category", "Kategorie", 130),
             ("number", "Nummer", 80),
             ("last", "Nachname", 170),
             ("first", "Vorname", 170),
+            ("active", "Status", 90),
             ("detail", "Hinweis", 390),
         ):
             tree.heading(key, text=title)
-            tree.column(key, width=width, minwidth=60)
+            tree.column(key, width=width, minwidth=width, stretch=key == "detail")
         tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        scroll_x.grid(row=1, column=0, sticky=(tk.W, tk.E))
 
         def add_row(category, student, detail=""):
             tree.insert(
                 "",
                 tk.END,
-                values=(category, student.number, student.last_name, student.first_name, detail),
+                values=(category, student.number, student.last_name, student.first_name,
+                        "Aktiv" if student.active else "Inaktiv", detail),
             )
 
         for student in preview.new:
@@ -712,16 +791,17 @@ class PDFRenamerGUI:
         for student in preview.unchanged:
             add_row("Unverändert", student)
         for issue in preview.conflicts:
-            add_row("Konflikt", issue.student, issue.reason)
+            add_row("Konflikt", issue.student, f"Zeile {issue.row_number}: {issue.reason}")
         for issue in preview.duplicates:
-            add_row("Duplikat", issue.student, issue.reason)
+            add_row("Duplikat", issue.student, f"Zeile {issue.row_number}: {issue.reason}")
         for student in preview.missing:
             add_row("Fehlt in neuer Liste", student, "Bleibt erhalten")
 
         note = (
             "Es werden ausschließlich neue, konfliktfreie Einträge hinzugefügt. "
             "Konflikte und Duplikate werden übersprungen; fehlende historische "
-            "Einträge bleiben unverändert. Vor dem atomaren Schreiben wird ein Backup erstellt."
+            "Einträge bleiben unverändert. Änderungen an bestehenden Schülern können Sie "
+            "unter „Bearbeiten“ prüfen und speichern."
         )
         ttk.Label(dialog, text=note, wraplength=950).grid(
             row=2, column=0, sticky=tk.W, padx=10, pady=(8, 4)
@@ -738,12 +818,15 @@ class PDFRenamerGUI:
                 parent=dialog,
             ):
                 return
-            try:
-                result = self.student_admin.apply_import(preview, confirmed=True)
-            except Exception as error:
-                messagebox.showerror("Import fehlgeschlagen", str(error), parent=dialog)
-                return
-            dialog.destroy()
+            self._run_student_task(
+                "CSV importieren",
+                lambda: self.student_admin.apply_import(preview, confirmed=True),
+                imported,
+            )
+
+        def imported(result):
+            if dialog.winfo_exists():
+                dialog.destroy()
             self._after_student_change()
             backup = f"\nBackup: {result.backup_path}" if result.backup_path else ""
             messagebox.showinfo(
@@ -977,8 +1060,7 @@ class PDFRenamerGUI:
         self._apply_review_action(ReviewDecision.RENAME_ONLY)
 
     def _apply_review_action(self, decision, student_number=None):
-        if self.processing:
-            messagebox.showwarning("Warnung", "Bitte warten Sie bis zum Batch-Ende.")
+        if not self._ensure_idle():
             return
         if not self.current_review_item:
             messagebox.showwarning("Warnung", "Bitte wählen Sie eine Datei aus.")
@@ -1109,6 +1191,9 @@ class PDFRenamerGUI:
         return True
 
     def start_processing(self):
+        if getattr(self, "_student_task_running", False):
+            self._ensure_idle()
+            return
         if not self.validate_input():
             return
         if self.processing:
@@ -1167,7 +1252,8 @@ class PDFRenamerGUI:
         self.log_message("⏹️ Verarbeitung wird zwischen Dateien gestoppt.")
 
     def _set_batch_controls(self, running: bool):
-        self.start_button.config(state=tk.DISABLED if running else tk.NORMAL)
+        registry_busy = getattr(self, "_student_task_running", False)
+        self.start_button.config(state=tk.DISABLED if running or registry_busy else tk.NORMAL)
         self.stop_button.config(state=tk.NORMAL if running else tk.DISABLED)
         self.folder_entry.config(state=tk.DISABLED if running else tk.NORMAL)
         self.browse_button.config(state=tk.DISABLED if running else tk.NORMAL)
@@ -1175,9 +1261,12 @@ class PDFRenamerGUI:
         self.month_combo.config(state=tk.DISABLED if running else "readonly")
         self.year_entry.config(state=tk.DISABLED if running else tk.NORMAL)
         for button in self.student_mutation_buttons:
-            button.config(state=tk.DISABLED if running else tk.NORMAL)
+            button.config(state=tk.DISABLED if running or registry_busy else tk.NORMAL)
 
     def _on_close(self):
+        if getattr(self, "_student_task_running", False):
+            self._ensure_idle()
+            return
         if not self.processing:
             self.root.destroy()
             return

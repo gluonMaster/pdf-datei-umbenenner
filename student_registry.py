@@ -11,6 +11,7 @@ import csv
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from enum import Enum
+import hashlib
 import io
 import json
 import math
@@ -242,6 +243,7 @@ class StudentRegistry:
         self._aliases_need_migration = False
         self._schema: Optional[_CsvSchema] = None
         self._load_error: Optional[str] = None
+        self._source_hashes: Optional[tuple[str, Optional[str]]] = None
         self.reload()
 
     @property
@@ -276,10 +278,13 @@ class StudentRegistry:
         """Reload both files, returning whether the complete registry is valid."""
 
         try:
+            source_hashes = self._read_source_hashes()
             students, schema = self._read_students(self.csv_path)
             by_number = {student.number: student for student in students}
             aliases, aliases_need_migration = self._read_aliases(self.aliases_path, by_number)
             self._validate_alias_conflicts(students, aliases)
+            if source_hashes != self._read_source_hashes():
+                raise RegistryValidationError("Das Schülerverzeichnis wurde beim Laden geändert.")
         except (OSError, UnicodeError, csv.Error, json.JSONDecodeError,
                 RegistryValidationError, TypeError, ValueError) as exc:
             self._students = ()
@@ -287,6 +292,7 @@ class StudentRegistry:
             self._aliases = {}
             self._aliases_need_migration = False
             self._schema = None
+            self._source_hashes = None
             self._load_error = (
                 f"Das Schülerverzeichnis ist nicht verfügbar: {exc}. "
                 "Betroffene Dokumente müssen manuell geprüft werden."
@@ -299,7 +305,37 @@ class StudentRegistry:
         self._aliases_need_migration = aliases_need_migration
         self._schema = schema
         self._load_error = None
+        self._source_hashes = source_hashes
         return True
+
+    def _read_source_hashes(self) -> tuple[str, Optional[str]]:
+        csv_hash = hashlib.sha256(self.csv_path.read_bytes()).hexdigest()
+        try:
+            aliases_hash = hashlib.sha256(self.aliases_path.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            aliases_hash = None
+        return csv_hash, aliases_hash
+
+    def checked_fingerprint(self) -> str:
+        """Identify the loaded files and reject writes from an outdated matcher.
+
+        This detects external edits, including extra CSV columns and aliases.
+        It is an optimistic check, not an inter-process file lock.
+        """
+        self._require_available()
+        try:
+            current = self._read_source_hashes()
+        except OSError as exc:
+            raise RegistryValidationError(
+                "Das Schülerverzeichnis kann nicht geprüft werden; bitte aktualisieren."
+            ) from exc
+        if current != self._source_hashes:
+            raise RegistryValidationError(
+                "Das Schülerverzeichnis wurde außerhalb der Anwendung geändert; "
+                "bitte zuerst „Aktualisieren“ wählen und eine neue Vorschau erstellen."
+            )
+        identity = (str(self.csv_path.resolve()), str(self.aliases_path.resolve()), current)
+        return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
 
     def match(self, raw_name: str) -> StudentMatch:
         """Resolve a parser name without mutating or guessing a student."""
@@ -898,7 +934,10 @@ class StudentRegistry:
             if schema.has_active:
                 row["Aktiv"] = "1" if student.active else "0"
             writer.writerow(row)
-        self._atomic_write_bytes(self.csv_path, output.getvalue().encode(schema.encoding))
+        encoded = output.getvalue().encode(schema.encoding)
+        self.checked_fingerprint()
+        self._atomic_write_bytes(self.csv_path, encoded)
+        self._source_hashes = (hashlib.sha256(encoded).hexdigest(), self._source_hashes[1])
 
     @staticmethod
     def _validate_students_for_write(students: Sequence[Student]) -> None:
@@ -936,9 +975,11 @@ class StudentRegistry:
         encoded = (
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         ).encode("utf-8")
+        self.checked_fingerprint()
         if self._aliases_need_migration:
             self._create_backup(self.aliases_path)
         self._atomic_write_bytes(self.aliases_path, encoded)
+        self._source_hashes = (self._source_hashes[0], hashlib.sha256(encoded).hexdigest())
         self._aliases_need_migration = False
 
     @staticmethod
