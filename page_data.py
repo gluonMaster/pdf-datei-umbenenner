@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 
 class ExtractionSource(str, Enum):
@@ -45,12 +45,19 @@ class PageCharacter:
 
 @dataclass(frozen=True)
 class PageImage:
-    """Rendered page image, kept only while one document is processed."""
+    """Rendered page image, kept only while one document is processed.
+
+    ``reader`` recognizes a pixel box of this image and returns words in image
+    pixel coordinates; it is supplied by the OCR engine that rendered the page.
+    """
 
     png: bytes = field(repr=False)
     width: int
     height: int
     dpi: int
+    reader: Optional[Callable[["PageImage", Tuple[float, float, float, float]], tuple]] = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)

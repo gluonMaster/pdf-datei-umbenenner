@@ -45,6 +45,10 @@ class ReviewItem:
     ocr_status: Optional[str] = None
     ocr_name_confidence: Optional[float] = None
     ocr_subject_confidence: Optional[float] = None
+    # Recognition evidence (scan_recognition_v3); empty for older entries.
+    birth_date: Optional[str] = None
+    subject_proposal: Optional[str] = None
+    field_evidence: List[dict] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         """Преобразует ReviewItem в словарь"""
@@ -66,6 +70,7 @@ class ReviewItem:
         payload.setdefault("preview_text", "")
         payload.setdefault("parser_reasons", [])
         payload.setdefault("student_suggestions", [])
+        payload.setdefault("field_evidence", [])
         item = cls(**payload)
         item._validate_types()
         return item
@@ -90,11 +95,18 @@ class ReviewItem:
             "planned_filename",
             "extraction_source",
             "ocr_status",
+            "birth_date",
+            "subject_proposal",
         )
         for field_name in optional_text:
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"'{field_name}' muss Text oder null sein")
+
+        if not isinstance(self.field_evidence, list) or not all(
+            isinstance(entry, dict) for entry in self.field_evidence
+        ):
+            raise TypeError("'field_evidence' muss eine Liste von JSON-Objekten sein")
 
         for field_name in ("suggestions", "parser_reasons", "student_suggestions"):
             value = getattr(self, field_name)

@@ -172,7 +172,9 @@ def test_attendance_strategy_joins_split_subject_words():
     assert not result.warnings
 
 
-def test_attendance_strategy_handles_missing_neighbor_anchor_with_warning():
+def test_attendance_strategy_notes_missing_neighbor_anchor():
+    # scan_recognition_v3: an estimated boundary is informational when the
+    # column content is consistent; formerly every missing anchor blocked.
     page = _attendance_page()
     words = tuple(word for word in page.words if word.text != "Ort")
     page = PageData(
@@ -186,6 +188,17 @@ def test_attendance_strategy_handles_missing_neighbor_anchor_with_warning():
 
     assert result.form_type == FormType.ATTENDANCE
     assert result.student_name == "Sample Student"
+    assert result.subject == "Deutsch"
+    assert not result.requires_review
+    assert any("'Ort' fehlt" in note for note in result.notes)
+
+
+def test_estimated_boundary_blocks_when_column_content_is_thin():
+    page = _attendance_page(subjects=["Deutsch", "Deutsch"])
+    words = tuple(word for word in page.words if word.text != "Ort")
+
+    result = FormParser().parse(replace(page, words=words, text=page.text.replace(" Ort", "")))
+
     assert result.subject == "Deutsch"
     assert result.requires_review
     assert any("'Ort' fehlt" in warning for warning in result.warnings)
@@ -279,8 +292,9 @@ def test_missing_region_boundary_is_reported(missing):
 
     assert result.student_name == "Sample Student"
     assert result.subject == "Deutsch"
-    assert result.requires_review
-    assert any(f"'{missing}'" in warning for warning in result.warnings)
+    # Estimated, but the field content is plausible and consistent.
+    assert not result.requires_review
+    assert any(f"'{missing}'" in note for note in result.notes)
 
 
 def test_neighbor_anchors_must_belong_to_table_header():

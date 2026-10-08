@@ -3,3 +3,5 @@ pdfplumber>=0.7.0
 # First-page rendering for OCR, which reads every document.
 # Tesseract with German language data is a separate system install.
 PyMuPDF>=1.27,<1.29
+# Cropping single fields for an additional OCR reading.
+Pillow>=8.0

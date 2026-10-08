@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
@@ -51,6 +52,11 @@ class FoundDocumentData:
     warnings: Tuple[str, ...] = ()
     name_confidence: Optional[float] = None
     subject_confidence: Optional[float] = None
+    birth_date: Optional[date] = None
+    raw_birth_date: Optional[str] = None
+    subject_proposal: Optional[str] = None
+    notes: Tuple[str, ...] = ()
+    evidence: Tuple[Any, ...] = ()
 
     @property
     def raw_name(self) -> Optional[str]:
@@ -223,6 +229,8 @@ class DocumentProcessingService:
             found_data, form_type = self._found_data(raw_parse_result)
             stages.append(ProcessingStage.PARSING)
             warnings.extend(found_data.warnings)
+            # Informational notes are shown with the result but never block it.
+            warnings.extend(found_data.notes)
 
             match_name = found_data.student_name or found_data.raw_student_name or ""
             current_stage = ProcessingStage.STUDENT_MATCHING
@@ -431,6 +439,7 @@ class DocumentProcessingService:
         confidence = float(getattr(parsed, "confidence", 0.0) or 0.0)
         name_confidence = getattr(parsed, "name_confidence", None)
         subject_confidence = getattr(parsed, "subject_confidence", None)
+        birth_date = getattr(parsed, "birth_date", None)
         return (
             FoundDocumentData(
                 raw_name,
@@ -442,6 +451,11 @@ class DocumentProcessingService:
                 warnings,
                 name_confidence,
                 subject_confidence,
+                birth_date if isinstance(birth_date, date) else None,
+                getattr(parsed, "raw_birth_date", None),
+                getattr(parsed, "subject_proposal", None),
+                tuple(str(item) for item in (getattr(parsed, "notes", ()) or ())),
+                tuple(getattr(parsed, "evidence", ()) or ()),
             ),
             form_type,
         )
@@ -565,6 +579,14 @@ class DocumentProcessingService:
             ocr_status=getattr(extraction, "ocr_status", None),
             ocr_name_confidence=found_data.name_confidence,
             ocr_subject_confidence=found_data.subject_confidence,
+            birth_date=(
+                found_data.birth_date.isoformat() if found_data.birth_date else None
+            ),
+            subject_proposal=found_data.subject_proposal,
+            field_evidence=[
+                item.to_dict() for item in found_data.evidence
+                if callable(getattr(item, "to_dict", None))
+            ],
         )
 
         return ProcessingResult(

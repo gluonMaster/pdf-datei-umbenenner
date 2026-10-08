@@ -341,6 +341,56 @@ class TesseractOCRProvider(OCRProvider):
                 f"OCR fehlgeschlagen: {str(error).strip() or error.__class__.__name__}"
             )
 
+    def recognize_region(
+        self,
+        image: PageImage,
+        box: Tuple[float, float, float, float],
+    ) -> Tuple[OCRWord, ...]:
+        """Recognize one text line inside a pixel box of a rendered page.
+
+        Used as an additional reading of a single field. Coordinates of the
+        returned words refer to the whole image. Failures return no words.
+        """
+
+        availability = self.check_availability()
+        if not availability.available or availability.executable is None:
+            return ()
+        left = max(0, int(box[0]))
+        top = max(0, int(box[1]))
+        right = min(image.width, int(box[2]) + 1)
+        bottom = min(image.height, int(box[3]) + 1)
+        if right - left < 4 or bottom - top < 4:
+            return ()
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image.png)) as full:
+                buffer = io.BytesIO()
+                full.crop((left, top, right, bottom)).save(buffer, "PNG")
+            completed = self._run(
+                [
+                    str(availability.executable),
+                    "stdin",
+                    "stdout",
+                    "-l",
+                    "+".join(self.languages),
+                    "--dpi",
+                    str(image.dpi),
+                    "--psm",
+                    "7",
+                    "tsv",
+                ],
+                input_bytes=buffer.getvalue(),
+            )
+        except Exception:
+            return ()
+        if completed.returncode != 0:
+            return ()
+        return tuple(
+            replace(word, left=word.left + left, top=word.top + top)
+            for word in self._parse_tsv(self._decode(completed.stdout))
+        )
+
     def detect_rotation(self, image: PageImage) -> Optional[int]:
         """Return the clockwise correction suggested by Tesseract OSD, if any.
 
@@ -455,6 +505,7 @@ class TesseractOCRProvider(OCRProvider):
                     int(pixmap.width),
                     int(pixmap.height),
                     self.dpi,
+                    reader=self.recognize_region,
                 ),
                 width,
                 height,

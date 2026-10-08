@@ -70,6 +70,7 @@ class EvaluationRow:
     form_detected: Optional[bool] = None
     name_read: Optional[bool] = None
     subject_read: Optional[bool] = None
+    birth_date_found: Optional[bool] = None
 
 
 def _normalize(value: str) -> str:
@@ -261,6 +262,7 @@ def format_summary(rows: Sequence[EvaluationRow]) -> List[str]:
         ("Formulartyp erkannt", "form_detected"),
         ("Name korrekt gelesen", "name_read"),
         ("Fach korrekt gelesen", "subject_read"),
+        ("Geburtsdatum gefunden (ohne Referenz)", "birth_date_found"),
     ):
         values = [getattr(row, attribute) for row in rows if getattr(row, attribute) is not None]
         if values:
@@ -391,6 +393,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _describe_decision(result),
             elapsed,
             *field_readings(expectation, result),
+            getattr(result.found_data, "birth_date", None) is not None
+            if result.found_data is not None else None,
         ))
 
     data_changed = snapshot(folder, data_files) != before

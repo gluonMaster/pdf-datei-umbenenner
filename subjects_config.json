@@ -5,6 +5,7 @@
     "Deutsch",
     "Englisch",
     "Geografie",
+    "Informatik",
     "Mathematik",
     "Physik",
     "Sachkunde",
@@ -13,6 +14,7 @@
   "aliases": {
     "Mathe": "Mathematik",
     "Bio": "Biologie",
-    "Geo": "Geografie"
+    "Geo": "Geografie",
+    "Sachunt.": "Sachunterricht"
   }
 }
