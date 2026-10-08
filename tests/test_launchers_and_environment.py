@@ -193,12 +193,17 @@ def test_batch_files_are_ascii_and_use_the_local_environment():
     assert "--core-only" in setup
     assert "--force-reinstall --no-cache-dir" in setup
     assert "install_vc_runtime.ps1" in setup
-    assert 'if "%ocr_required%"=="1"' in setup
+    assert "ocr_required" not in setup
+    assert "auto_vc_runtime" not in setup
+    assert 'if /i "%~1"=="--unattended" goto select_core_only' in setup
     assert '"%venv_python%" -m pip install' in smart
     assert "requirements-current" in smart
     assert "--health-only" in smart
     assert smart.index("requirements-current") < smart.index(":repair_environment")
     assert "%~dp0start_app.bat" in shortcut
+    assert 'set "python_manager_automatic_install=false"' in setup
+    assert 'set "python_manager_automatic_install=false"' in smart
+    assert "--clear" not in setup + smart
 
 
 def test_quick_start_never_installs_or_repairs_packages():

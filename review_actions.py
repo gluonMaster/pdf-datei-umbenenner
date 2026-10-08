@@ -172,14 +172,21 @@ class ReviewActionService:
                 raise
             if not moved:
                 self._release_reservation(target_path)
-                raise OSError(f"PDF konnte nicht nach {target_path.name} verschoben werden.")
+                raise OSError(
+                    f"PDF konnte nicht nach {target_path.name} verschoben werden. "
+                    + (getattr(self.renamer, "last_error", None) or "")
+                )
             file_moved = True
 
             if not self._remove_from_queue_safely(request.item.file_path):
+                rollback_error = None
                 try:
                     rolled_back = self.renamer.move_file(target_path, source_path)
-                except Exception:
+                    if not rolled_back:
+                        rollback_error = getattr(self.renamer, "last_error", None)
+                except Exception as error:
                     rolled_back = False
+                    rollback_error = str(error) or error.__class__.__name__
                 self._release_reservation(target_path)
                 if rolled_back:
                     file_moved = False
@@ -212,7 +219,8 @@ class ReviewActionService:
                         "Der Eintrag wurde auf den neuen Pfad aktualisiert."
                         if recovery_saved
                         else f"Bitte Datei und Warteschlange manuell prüfen: {target_path}"
-                    ),
+                    )
+                    + (f" Rückverschieben: {rollback_error}" if rollback_error else ""),
                     target_path,
                     student,
                     registry_saved,

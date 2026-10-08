@@ -33,13 +33,18 @@ dist/
 Thumbs.db
 Desktop.ini
 
-# Logs, temporary files, and local backups
+# Diagnostic logs and generated bootstrap files (keep user data/backups visible)
 *.log
-*.tmp
-*.temp
-*.bak
-*.old
 ~$*
 .launcher-logs/
 .bootstrap/
 bootstrap-*.tmp
+
+# Local personal data: registries, learned aliases, review queue and scans
+/Schuler.csv
+/Schuler.csv.bak*
+/Lehrer.csv
+/student_aliases.json
+/manual_review.json
+/scans/
+/Scans/

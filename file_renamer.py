@@ -20,6 +20,7 @@ class FileRenamer:
     }
     
     def __init__(self):
+        self.last_error: Optional[str] = None
         self.renamed_files: Dict[str, int] = {}  # Счетчик для дубликатов
         self.processed_names: Set[str] = set()   # Уже обработанные имена
         # Absolute, case-insensitive paths reserved by the current batch.  A
@@ -245,6 +246,7 @@ class FileRenamer:
         """
         source_path = Path(source_path)
         target_path = Path(target_path)
+        self.last_error = None
         try:
             if dry_run:
                 print(f"  [Simulation] {source_path.name} -> {target_path.name}")
@@ -253,11 +255,13 @@ class FileRenamer:
             self._move_no_clobber(source_path, target_path)
             return True
 
-        except FileExistsError:
+        except FileExistsError as error:
+            self.last_error = str(error) or error.__class__.__name__
             self.release_target_path(target_path)
             print(f"  Warnung: Datei {target_path.name} existiert bereits")
             return False
         except Exception as error:
+            self.last_error = str(error) or error.__class__.__name__
             self.release_target_path(target_path)
             print(f"  Fehler beim Umbenennen: {error}")
             return False
@@ -272,6 +276,7 @@ class FileRenamer:
 
         source_path = Path(source_path)
         target_path = Path(target_path)
+        self.last_error = None
         try:
             if dry_run:
                 print(f"  [Simulation] {source_path} -> {target_path}")
@@ -279,11 +284,13 @@ class FileRenamer:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             self._move_no_clobber(source_path, target_path)
             return True
-        except FileExistsError:
+        except FileExistsError as error:
+            self.last_error = str(error) or error.__class__.__name__
             self.release_target_path(target_path)
             print(f"  Warnung: Datei {target_path.name} existiert bereits")
             return False
         except Exception as error:
+            self.last_error = str(error) or error.__class__.__name__
             self.release_target_path(target_path)
             print(f"  Fehler beim Verschieben: {error}")
             return False
@@ -323,12 +330,17 @@ class FileRenamer:
                     os.fsync(target_handle.fileno())
             shutil.copystat(source_path, target_path)
             source_path.unlink()
-        except Exception:
+        except Exception as error:
             if target_created:
                 try:
                     target_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    raise OSError(
+                        f"Verschieben fehlgeschlagen: {error}. "
+                        f"Die angelegte Zieldatei konnte nicht entfernt werden: "
+                        f"{target_path} ({cleanup_error}). "
+                        f"Quelldatei bleibt unter: {source_path}."
+                    ) from error
             raise
 
     @classmethod
@@ -379,12 +391,17 @@ class FileRenamer:
             return
         except FileExistsError:
             raise
-        except OSError:
+        except OSError as error:
             if linked:
                 try:
                     target_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    raise OSError(
+                        f"Verschieben fehlgeschlagen: {error}. "
+                        f"Die angelegte Dateiverknüpfung konnte nicht entfernt werden: "
+                        f"{target_path} ({cleanup_error}). "
+                        f"Quelldatei bleibt unter: {source_path}."
+                    ) from error
                 raise
 
         # Hard links may be unavailable (cross-volume, network filesystem, or
@@ -409,6 +426,7 @@ class FileRenamer:
             Path к перемещённому файлу или None при ошибке
         """
         target_path = None
+        self.last_error = None
         try:
             if create_folder:
                 target_folder.mkdir(parents=True, exist_ok=True)
@@ -422,6 +440,7 @@ class FileRenamer:
             return target_path  # Возвращаем фактический путь
             
         except Exception as error:
+            self.last_error = str(error) or error.__class__.__name__
             if target_path is not None:
                 self.release_target_path(target_path)
             print(f"  Fehler beim Verschieben: {error}")

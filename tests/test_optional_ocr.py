@@ -20,7 +20,7 @@ from page_data import ExtractionSource, PageData
 from pdf_extractor import OCRFallbackExtractor, PDFExtractor
 from processing_service import DocumentProcessingService, PlannedAction
 from review_queue import ReviewStore
-from student_registry import MatchStatus, Student, StudentMatch
+from student_registry import MatchStatus, Student, StudentMatch, StudentRegistry
 from validator import Validator
 
 
@@ -169,6 +169,22 @@ def test_unavailable_ocr_is_diagnostic_manual_review(tmp_path):
     assert result.planned_path.exists()
 
 
+def test_image_only_pdf_without_ocr_keeps_a_read_only_review_plan(tmp_path):
+    source = tmp_path / "without-text-layer.pdf"
+    _image_only_pdf(source)
+    original = source.read_bytes()
+    service = _service(tmp_path, PDFExtractor())
+
+    result = service.process_document(source, month=8, year=2046, dry_run=True)
+
+    assert result.error is None and result.requires_review
+    assert result.extraction.diagnostics
+    assert source.read_bytes() == original
+    assert service.review_store.count() == 0
+    assert not (tmp_path / "manual_review.json").exists()
+    assert not (tmp_path / "manual_check").exists()
+
+
 def test_ocr_provider_exception_is_controlled(tmp_path):
     source = tmp_path / "exception.pdf"
     _image_only_pdf(source)
@@ -269,10 +285,20 @@ def test_real_tesseract_image_only_pdf_when_available(tmp_path):
     source = tmp_path / "anonymous-image-only.pdf"
     image.save(source, "PDF", resolution=300.0)
 
-    page = OCRFallbackExtractor(PDFExtractor(), provider).extract_page_data(source)
-    parsed = FormParser().parse(page)
+    original = source.read_bytes()
+    registry_path = tmp_path / "Schuler.csv"
+    registry_path.write_text(
+        "Nummer;Nachname;Vorname\n7;Sample;Student\n", encoding="utf-8"
+    )
+    service = _service(tmp_path, OCRFallbackExtractor(PDFExtractor(), provider))
+    service.student_registry = StudentRegistry(registry_path)
+    result = service.process_document(source, month=9, year=2046, dry_run=True)
 
-    assert page.source == ExtractionSource.OCR
-    assert parsed.form_type == FormType.LEGACY
-    assert parsed.student_name == "Sample Student"
-    assert parsed.subject == "Mathematik"
+    assert result.extraction.source == ExtractionSource.OCR
+    assert result.form_type == FormType.LEGACY.value
+    assert result.found_data.student_name == "Sample Student"
+    assert result.canonical_subject == "Mathematik"
+    assert result.succeeded, result.review_item or result.error
+    assert result.planned_name == "Sample_Student_Mathematik_September_2046.pdf"
+    assert source.read_bytes() == original
+    assert not (tmp_path / "manual_review.json").exists()

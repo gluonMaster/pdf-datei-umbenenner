@@ -229,8 +229,14 @@ class ReviewStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary_path, self.store_path)
-            except Exception:
-                temporary_path.unlink(missing_ok=True)
+            except Exception as error:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    raise OSError(
+                        f"Speichern fehlgeschlagen: {error}. Temporäre Datei "
+                        f"konnte nicht entfernt werden: {temporary_path} ({cleanup_error})."
+                    ) from error
                 raise
             return True
             

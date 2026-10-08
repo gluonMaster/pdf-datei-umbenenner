@@ -594,7 +594,10 @@ class DocumentProcessingService:
                 raise ValueError("Geplanter Zielpfad fehlt.")
             if plan.planned_action == PlannedAction.RENAME:
                 if not self.renamer.rename_file(plan.pdf_path, target):
-                    raise OSError(f"Datei konnte nicht in {target.name} umbenannt werden.")
+                    raise OSError(
+                        f"Datei konnte nicht in {target.name} umbenannt werden. "
+                        + (getattr(self.renamer, "last_error", None) or "")
+                    )
                 actual_path = target
                 performed_action = PerformedAction.RENAMED
             elif plan.planned_action == PlannedAction.MANUAL_REVIEW:
@@ -605,7 +608,8 @@ class DocumentProcessingService:
                 previous_items = self.review_store.get_all()
                 if not self.renamer.move_file(plan.pdf_path, target):
                     raise OSError(
-                        f"Datei konnte nicht nach {target.parent.name} verschoben werden."
+                        f"Datei konnte nicht nach {target.parent.name} verschoben werden. "
+                        + (getattr(self.renamer, "last_error", None) or "")
                     )
                 actual_path = target
                 performed_action = PerformedAction.MOVED_TO_REVIEW
@@ -620,6 +624,8 @@ class DocumentProcessingService:
                     rollback_error = None
                     try:
                         rolled_back = self.renamer.move_file(target, plan.pdf_path)
+                        if not rolled_back:
+                            rollback_error = getattr(self.renamer, "last_error", None)
                     except Exception as error:
                         rolled_back = False
                         rollback_error = str(error) or error.__class__.__name__

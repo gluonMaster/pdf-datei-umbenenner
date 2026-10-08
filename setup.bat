@@ -8,15 +8,16 @@ set "LOG_DIR=%~dp0.launcher-logs"
 set "LOG_FILE=%~dp0.launcher-logs\setup.log"
 set "SETUP_MODE=interactive"
 set "INSTALL_OCR=prompt"
-set "OCR_REQUIRED=0"
-set "AUTO_VC_RUNTIME=0"
 set "OCR_READY=0"
 set "OCR_REINSTALL_ATTEMPTED=0"
 set "VC_RUNTIME_ATTEMPTED=0"
+set "PYTHONIOENCODING=utf-8"
+rem The new Python install manager must not download a runtime implicitly.
+set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"
 
 :parse_arguments
 if "%~1"=="" goto arguments_done
-if /i "%~1"=="--unattended" goto select_unattended
+if /i "%~1"=="--unattended" goto select_core_only
 if /i "%~1"=="--core-only" goto select_core_only
 if /i "%~1"=="--help" goto show_usage
 if /i "%~1"=="-h" goto show_usage
@@ -24,37 +25,19 @@ echo FEHLER: Unbekannter Parameter: %~1
 echo Verwenden Sie setup.bat --help fuer die Aufrufhilfe.
 exit /b 64
 
-:select_unattended
-if /i not "%SETUP_MODE%"=="interactive" if /i not "%SETUP_MODE%"=="unattended" goto incompatible_modes
-set "SETUP_MODE=unattended"
-set "INSTALL_OCR=yes"
-set "OCR_REQUIRED=1"
-set "AUTO_VC_RUNTIME=1"
-shift
-goto parse_arguments
-
 :select_core_only
-if /i not "%SETUP_MODE%"=="interactive" if /i not "%SETUP_MODE%"=="core-only" goto incompatible_modes
 set "SETUP_MODE=core-only"
 set "INSTALL_OCR=no"
-set "OCR_REQUIRED=0"
-set "AUTO_VC_RUNTIME=0"
 shift
 goto parse_arguments
-
-:incompatible_modes
-echo FEHLER: --unattended und --core-only duerfen nicht kombiniert werden.
-exit /b 64
 
 :show_usage
 echo Aufruf:
 echo   setup.bat                 Interaktives Setup; OCR ist optional.
-echo   setup.bat --unattended    Ohne Rueckfragen; OCR ist erforderlich.
+echo   setup.bat --unattended    Alias fuer --core-only; keine Systeminstallation.
 echo   setup.bat --core-only     Ohne Rueckfragen; nur Kernanwendung.
 echo.
-echo --unattended repariert PyMuPDF automatisch. Bei einer fehlenden
-echo Windows-Laufzeit wird das signierte Microsoft VC++ Redistributable
-echo still installiert; dafuer muss die Konsole als Administrator laufen.
+echo OCR wird nur im interaktiven Setup nach Bestaetigung installiert.
 exit /b 0
 
 :arguments_done
@@ -71,7 +54,7 @@ if not exist "%LOG_DIR%" (
 )
 
 >"%LOG_FILE%" echo PDF Datei Umbenenner setup diagnostics
->>"%LOG_FILE%" echo Project: %PROJECT_DIR%
+>>"%LOG_FILE%" echo Project: "%PROJECT_DIR%"
 >>"%LOG_FILE%" echo Mode: %SETUP_MODE%
 
 echo ================================================================
@@ -80,33 +63,26 @@ echo ================================================================
 echo.
 echo Dieses Setup erstellt ein privates .venv im Anwendungsverzeichnis.
 echo Fuer die Kernanwendung sind keine Administratorrechte erforderlich.
-if /i "%SETUP_MODE%"=="unattended" echo Automatikmodus: OCR ist erforderlich; Rueckfragen sind deaktiviert.
 echo Diagnoselog: "%LOG_FILE%"
 echo.
 
-echo [1/5] Suche Python 3.10 oder neuer...
-call :find_supported_python
-if errorlevel 1 goto python_unavailable
-echo OK: Unterstuetztes Python wurde gefunden.
-"%BASE_PYTHON%" %BASE_PYTHON_ARGS% --version >>"%LOG_FILE%" 2>&1
-
-echo [2/5] Lokale Umgebung wird erstellt oder geprueft...
+echo [1/5] Lokales Python 3.10 oder neuer wird geprueft...
+if not exist "%PROJECT_DIR%bootstrap.py" (
+    set "FAIL_CODE=50"
+    echo FEHLER: bootstrap.py fehlt.
+    goto critical_failure
+)
 if not exist "%VENV_PYTHON%" goto create_venv
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-python >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto recreate_venv
+if not "%ERRORLEVEL%"=="0" goto create_venv
 echo OK: Das vorhandene .venv verwendet ein unterstuetztes Python.
 goto install_core
 
 :create_venv
-echo .venv wird erstellt...
-"%BASE_PYTHON%" %BASE_PYTHON_ARGS% -m venv "%PROJECT_DIR%.venv" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto venv_failed
-goto install_core
-
-:recreate_venv
-echo Das vorhandene .venv ist unvollstaendig oder nicht unterstuetzt.
-echo Die generierte Umgebung wird neu erstellt...
-"%BASE_PYTHON%" %BASE_PYTHON_ARGS% -m venv --clear "%PROJECT_DIR%.venv" >>"%LOG_FILE%" 2>&1
+echo [2/5] Suche Basis-Python und erstelle .venv...
+call :find_supported_python
+if errorlevel 1 goto python_unavailable
+"%BASE_PYTHON%" %BASE_PYTHON_ARGS% "%PROJECT_DIR%bootstrap.py" prepare-venv >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto venv_failed
 goto install_core
 
@@ -130,13 +106,24 @@ if errorlevel 1 goto pip_failed
 
 echo Kernpruefung wird ausgefuehrt...
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
+if "%ERRORLEVEL%"=="20" goto repair_core_imports
+if "%ERRORLEVEL%"=="22" goto repair_core_imports
 if errorlevel 1 goto health_failed
+goto stamp_core
+
+:repair_core_imports
+echo Beschaedigte Kernpakete werden einmal neu installiert...
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check --force-reinstall --no-cache-dir -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto pip_failed
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto health_failed
+
+:stamp_core
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" write-requirements-stamp >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto stamp_failed
 echo OK: Die Kernanwendung ist bereit.
 
 echo [4/5] Optionale OCR-Unterstuetzung...
-if /i "%INSTALL_OCR%"=="yes" goto install_ocr
 if /i "%INSTALL_OCR%"=="no" goto skip_ocr
 set "OCR_CHOICE="
 set /p "OCR_CHOICE=Optionale Python-OCR-Unterstuetzung installieren? [j/N]: "
@@ -152,9 +139,6 @@ goto optional_actions
 :install_ocr
 set "OCR_REINSTALL_ATTEMPTED=0"
 set "VC_RUNTIME_ATTEMPTED=0"
-echo Python-Installationswerkzeuge fuer OCR werden aktualisiert...
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel >>"%LOG_FILE%" 2>&1
-if errorlevel 1 echo WARNUNG: pip/setuptools/wheel konnten nicht aktualisiert werden; Installation wird trotzdem versucht.
 echo Optionale Python-OCR-Abhaengigkeiten werden installiert...
 "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r "%PROJECT_DIR%requirements-ocr.txt" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto repair_ocr_python
@@ -180,7 +164,6 @@ goto ocr_external_failed
 :handle_pymupdf_runtime
 if "%OCR_REINSTALL_ATTEMPTED%"=="0" goto repair_ocr_python
 if "%VC_RUNTIME_ATTEMPTED%"=="1" goto ocr_unavailable
-if "%AUTO_VC_RUNTIME%"=="1" goto install_vc_runtime
 echo PyMuPDF benoetigt die aktuelle Microsoft Visual C++ Windows-Laufzeit.
 echo Das Microsoft-Paket wird nur nach gueltiger digitaler Signatur ausgefuehrt.
 set "VC_RUNTIME_CHOICE="
@@ -216,7 +199,6 @@ goto ocr_unavailable
 :vc_runtime_failed
 set "OCR_CHECK_CODE=%VC_RUNTIME_CODE%"
 echo FEHLER: Die Microsoft VC++ Laufzeit konnte nicht automatisch eingerichtet werden.
-if "%VC_RUNTIME_CODE%"=="61" echo Starten Sie den Automatikmodus aus einer administrativen Konsole.
 goto ocr_unavailable
 
 :ocr_python_failed
@@ -232,26 +214,16 @@ goto ocr_unavailable
 
 :tesseract_unavailable
 echo FEHLER: Tesseract wurde nicht gefunden.
-goto maybe_offer_tesseract_instructions
+goto offer_tesseract_instructions
 
 :tesseract_languages_unavailable
 echo FEHLER: Die Tesseract-Sprachdaten deu und/oder eng fehlen.
-goto maybe_offer_tesseract_instructions
-
-:maybe_offer_tesseract_instructions
-if "%OCR_REQUIRED%"=="1" goto ocr_unavailable
 goto offer_tesseract_instructions
 
 :ocr_unavailable
-if "%OCR_REQUIRED%"=="1" goto required_ocr_failure
 echo WARNUNG: OCR ist nicht vollstaendig verfuegbar. Der Kernstart ist nicht betroffen.
 echo Details und der maschinenlesbare Grund stehen im Diagnoselog.
 goto optional_actions
-
-:required_ocr_failure
-set "FAIL_CODE=%OCR_CHECK_CODE%"
-echo FEHLER: OCR ist im Automatikmodus erforderlich.
-goto critical_failure
 
 :ocr_ready
 set "OCR_READY=1"
@@ -263,23 +235,19 @@ echo.
 echo Tesseract ist eine separate Systemkomponente und kann IT-Freigabe erfordern.
 echo Der interaktive Modus installiert sie nicht still und fordert keine hoeheren Rechte an.
 set "OPEN_TESSERACT_GUIDE="
-set /p "OPEN_TESSERACT_GUIDE=Offizielle Tesseract-Anleitung oeffnen? [j/N]: "
+set /p "OPEN_TESSERACT_GUIDE=Separate Tesseract-Systeminstallation vorbereiten (offizielle Anleitung oeffnen)? [j/N]: "
 if /i "%OPEN_TESSERACT_GUIDE%"=="Y" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="YES" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="J" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="JA" goto open_tesseract_guide
-goto optional_actions
+goto ocr_unavailable
 
 :open_tesseract_guide
 start "" "https://tesseract-ocr.github.io/tessdoc/Installation.html"
 echo Installieren Sie bei Freigabe Tesseract sowie die Sprachdaten deu und eng.
-set "RECHECK_OCR="
-set /p "RECHECK_OCR=OCR nach der Systemeinrichtung erneut pruefen? [j/N]: "
-if /i "%RECHECK_OCR%"=="Y" goto recheck_ocr
-if /i "%RECHECK_OCR%"=="YES" goto recheck_ocr
-if /i "%RECHECK_OCR%"=="J" goto recheck_ocr
-if /i "%RECHECK_OCR%"=="JA" goto recheck_ocr
-goto optional_actions
+set "OCR_CONTINUE="
+set /p "OCR_CONTINUE=Nach Abschluss oder Abbruch der Systemeinrichtung ENTER druecken: "
+goto recheck_ocr
 
 :recheck_ocr
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-ocr >>"%LOG_FILE%" 2>&1
@@ -336,9 +304,10 @@ echo FEHLER: Der angeforderte Testlauf ist fehlgeschlagen.
 goto critical_failure
 
 :python_unavailable
+set "FAIL_CODE=10"
 echo FEHLER: Python 3.10 oder neuer wurde nicht gefunden.
 echo Python muss separat aus offizieller Quelle installiert werden.
-if /i not "%SETUP_MODE%"=="interactive" exit /b 10
+if /i not "%SETUP_MODE%"=="interactive" goto critical_failure
 echo Ohne Ihre Aktion wird keine Systemsoftware installiert.
 set "OPEN_PYTHON_GUIDE="
 set /p "OPEN_PYTHON_GUIDE=Offizielle Python-Downloadseite oeffnen? [j/N]: "
@@ -346,7 +315,7 @@ if /i "%OPEN_PYTHON_GUIDE%"=="Y" start "" "https://www.python.org/downloads/wind
 if /i "%OPEN_PYTHON_GUIDE%"=="YES" start "" "https://www.python.org/downloads/windows/"
 if /i "%OPEN_PYTHON_GUIDE%"=="J" start "" "https://www.python.org/downloads/windows/"
 if /i "%OPEN_PYTHON_GUIDE%"=="JA" start "" "https://www.python.org/downloads/windows/"
-exit /b 10
+goto critical_failure
 
 :setup_success
 echo.
@@ -367,12 +336,10 @@ echo Diagnoselog: "%LOG_FILE%"
 exit /b %FAIL_CODE%
 
 :find_supported_python
-set "FOUND_PYTHON="
 set "BASE_PYTHON="
 set "BASE_PYTHON_ARGS="
 where py >nul 2>&1
 if errorlevel 1 goto try_python_command
-set "FOUND_PYTHON=1"
 py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 10)" >nul 2>&1
 if errorlevel 1 goto try_python_command
 set "BASE_PYTHON=py"
@@ -382,7 +349,6 @@ exit /b 0
 :try_python_command
 where python >nul 2>&1
 if errorlevel 1 exit /b 10
-set "FOUND_PYTHON=1"
 python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 10)" >nul 2>&1
 if errorlevel 1 exit /b 10
 set "BASE_PYTHON=python"

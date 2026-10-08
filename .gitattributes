@@ -1,0 +1,2 @@
+# Preserve CMD-compatible line endings on every checkout.
+*.bat text eol=crlf

@@ -999,15 +999,20 @@ class StudentRegistry:
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         except Exception as exc:
+            cleanup_detail = ""
             try:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_error:
+                cleanup_detail = (
+                    f" Temporäre Datei konnte nicht entfernt werden: "
+                    f"{temporary} ({cleanup_error})."
+                )
             if isinstance(exc, StudentRegistryError):
                 raise
             raise RegistryWriteError(
                 f"Datei {path} konnte nicht atomar gespeichert werden: {exc}"
+                + cleanup_detail
             ) from exc
 
     @classmethod
@@ -1025,8 +1030,11 @@ class StudentRegistry:
         cls._atomic_write_bytes(candidate, path.read_bytes())
         try:
             shutil.copystat(path, candidate)
-        except OSError:
-            pass
+        except OSError as error:
+            print(
+                f"Warnung: Sicherung wurde unter {candidate} gespeichert, "
+                f"aber Dateimetadaten konnten nicht übernommen werden: {error}"
+            )
         return candidate
 
     def _commit_students(

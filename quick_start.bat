@@ -4,6 +4,7 @@ title PDF Datei Umbenenner - Quick Start
 
 set "PROJECT_DIR=%~dp0"
 set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
+set "PYTHONIOENCODING=utf-8"
 
 cd /d "%PROJECT_DIR%"
 if errorlevel 1 (
@@ -24,4 +25,6 @@ if not exist "%PROJECT_DIR%start_gui.py" (
 )
 
 "%VENV_PYTHON%" "%PROJECT_DIR%start_gui.py"
-exit /b %ERRORLEVEL%
+set "APP_EXIT_CODE=%ERRORLEVEL%"
+if not "%APP_EXIT_CODE%"=="0" echo FEHLER: Anwendung konnte nicht erfolgreich beendet werden. Diagnose mit start_app.bat.
+exit /b %APP_EXIT_CODE%

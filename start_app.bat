@@ -6,6 +6,17 @@ set "PROJECT_DIR=%~dp0"
 set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
 set "LOG_DIR=%~dp0.launcher-logs"
 set "LOG_FILE=%~dp0.launcher-logs\start_app.log"
+set "PYTHONIOENCODING=utf-8"
+set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"
+set "REINSTALL_FLAGS="
+
+if not "%~2"=="" exit /b 64
+if "%~1"=="" goto arguments_done
+if /i "%~1"=="--health-only" goto arguments_done
+echo FEHLER: Erlaubter Parameter: --health-only
+exit /b 64
+
+:arguments_done
 
 cd /d "%PROJECT_DIR%"
 if errorlevel 1 (
@@ -20,7 +31,7 @@ if not exist "%LOG_DIR%" (
 )
 
 >"%LOG_FILE%" echo PDF Datei Umbenenner launcher diagnostics
->>"%LOG_FILE%" echo Project: %PROJECT_DIR%
+>>"%LOG_FILE%" echo Project: "%PROJECT_DIR%"
 
 echo ================================================================
 echo   PDF Datei Umbenenner - Smart Launcher
@@ -36,6 +47,9 @@ if not exist "%PROJECT_DIR%bootstrap.py" (
 
 if not exist "%VENV_PYTHON%" goto repair_missing_environment
 
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-python >>"%LOG_FILE%" 2>&1
+if not "%ERRORLEVEL%"=="0" goto repair_failed_health
+
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" requirements-current >>"%LOG_FILE%" 2>&1
 set "REQUIREMENTS_CODE=%ERRORLEVEL%"
 if "%REQUIREMENTS_CODE%"=="40" goto repair_changed_requirements
@@ -45,7 +59,7 @@ if not "%REQUIREMENTS_CODE%"=="0" goto requirements_check_failed
 set "CORE_CODE=%ERRORLEVEL%"
 if "%CORE_CODE%"=="10" goto repair_failed_health
 if "%CORE_CODE%"=="20" goto repair_failed_health
-if "%CORE_CODE%"=="21" goto repair_failed_health
+if "%CORE_CODE%"=="21" goto tkinter_failed
 if "%CORE_CODE%"=="22" goto repair_failed_health
 if not "%CORE_CODE%"=="0" goto core_data_failed
 
@@ -62,6 +76,7 @@ goto repair_environment
 
 :repair_failed_health
 set "REPAIR_REASON=Die Kernpruefung ist fehlgeschlagen."
+set "REINSTALL_FLAGS=--force-reinstall --no-cache-dir"
 goto repair_environment
 
 :requirements_check_failed
@@ -72,8 +87,13 @@ goto launcher_failure
 
 :core_data_failed
 set "FAIL_CODE=%CORE_CODE%"
-echo FEHLER: Konfiguration oder Schuelerverzeichnis sind nicht lesbar.
-echo Eine Paketinstallation kann Benutzerdaten nicht reparieren und wird daher nicht gestartet.
+echo FEHLER: Die Kernpruefung ist fehlgeschlagen. Code: %CORE_CODE%.
+echo Pruefen Sie Konfiguration und Schuelerverzeichnis anhand des Diagnoselogs.
+goto launcher_failure
+
+:tkinter_failed
+set "FAIL_CODE=21"
+echo FEHLER: tkinter/Tcl fehlt oder ist beschaedigt. Python mit Tcl/Tk-Unterstuetzung reparieren.
 goto launcher_failure
 
 :repair_environment
@@ -130,36 +150,40 @@ exit /b %FAIL_CODE%
 if not exist "%VENV_PYTHON%" goto repair_create_venv
 
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-python >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto repair_recreate_venv
+if not "%ERRORLEVEL%"=="0" goto repair_create_venv
 goto repair_install_core
 
 :repair_create_venv
 call :find_supported_python
 if errorlevel 1 exit /b 10
-"%BASE_PYTHON%" %BASE_PYTHON_ARGS% -m venv "%PROJECT_DIR%.venv" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
-goto repair_install_core
-
-:repair_recreate_venv
-call :find_supported_python
-if errorlevel 1 exit /b 10
-"%BASE_PYTHON%" %BASE_PYTHON_ARGS% -m venv --clear "%PROJECT_DIR%.venv" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
+"%BASE_PYTHON%" %BASE_PYTHON_ARGS% "%PROJECT_DIR%bootstrap.py" prepare-venv >>"%LOG_FILE%" 2>&1
+if errorlevel 1 exit /b %ERRORLEVEL%
 goto repair_install_core
 
 :repair_install_core
 if not exist "%VENV_PYTHON%" exit /b 50
 "%VENV_PYTHON%" -m ensurepip --upgrade >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 exit /b 50
-"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
 if errorlevel 1 exit /b %ERRORLEVEL%
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check %REINSTALL_FLAGS% -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
+if errorlevel 1 exit /b %ERRORLEVEL%
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
+if "%ERRORLEVEL%"=="20" goto repair_imports_retry
+if "%ERRORLEVEL%"=="22" goto repair_imports_retry
+if errorlevel 1 exit /b %ERRORLEVEL%
+goto repair_write_stamp
+
+:repair_imports_retry
+if defined REINSTALL_FLAGS exit /b %ERRORLEVEL%
+set "REINSTALL_FLAGS=--force-reinstall --no-cache-dir"
+goto repair_install_core
+
+:repair_write_stamp
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" write-requirements-stamp >>"%LOG_FILE%" 2>&1
 if errorlevel 1 exit /b %ERRORLEVEL%
 exit /b 0
 
 :find_supported_python
+echo Suche Python 3.10 oder neuer. Falls es fehlt: setup.bat starten.
 set "BASE_PYTHON="
 set "BASE_PYTHON_ARGS="
 where py >nul 2>&1

@@ -1417,6 +1417,10 @@ def main():
     try:
         PDFRenamerGUI().run()
     except Exception as error:
+        # start_app.bat redirects stderr to its diagnostic log.
+        import traceback
+
+        traceback.print_exc()
         messagebox.showerror(
             "Kritischer Fehler",
             f"Die Anwendung konnte nicht gestartet werden:\n{error}",

@@ -2,7 +2,7 @@
 
 The file intentionally uses syntax supported by older Python versions so it can
 print a useful error before the application (which requires Python 3.10) is
-imported.  It never installs packages or changes system configuration.
+imported. It can create a local venv, but never installs system components.
 """
 
 import argparse
@@ -10,9 +10,12 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 from enum import IntEnum
 from pathlib import Path
 import sys
+import uuid
+import venv
 
 
 MINIMUM_PYTHON = (3, 10)
@@ -119,7 +122,7 @@ def _check_subjects_config(project_root):
             and subject.strip()
             for alias, subject in aliases.items()
         ):
-            raise ValueError("Alias und Ziel müssen jeweils nichtleerer Text sein")
+            raise ValueError("Alias und Ziel muessen jeweils nichtleerer Text sein")
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         detail = str(error).strip() or error.__class__.__name__
         print("CONFIG_UNREADABLE: Konfiguration unlesbar: " + str(config_path) + " (" + detail + ").")
@@ -168,6 +171,16 @@ def check_core(project_root=PROJECT_ROOT):
     )
     if code != ExitCode.OK:
         return code
+
+    try:
+        import tkinter
+
+        # An import alone does not detect a missing/broken Tcl installation.
+        # Tcl() does not create a visible window.
+        tkinter.Tcl().eval("info patchlevel")
+    except Exception as error:
+        print("TKINTER_UNAVAILABLE: Tcl kann nicht initialisiert werden (" + str(error) + ").")
+        return ExitCode.TKINTER_UNAVAILABLE
 
     code = _import_modules(
         CORE_APPLICATION_MODULES,
@@ -350,6 +363,38 @@ def write_requirements_stamp(project_root=PROJECT_ROOT):
     return ExitCode.OK
 
 
+def prepare_venv(project_root=PROJECT_ROOT):
+    """Create a fresh local environment, preserving an existing broken one.
+
+    Called with a supported base interpreter only when the local interpreter
+    is absent or unusable. Never clear a directory or follow a junction outside
+    the project; backups remain available for manual recovery.
+    """
+
+    code = check_python_version()
+    if code != ExitCode.OK:
+        return code
+    project_root = Path(project_root).resolve()
+    target = project_root / ".venv"
+    backup_root = project_root / ".bootstrap"
+    try:
+        if target.resolve() != target or backup_root.resolve() != backup_root:
+            raise ValueError(".venv und .bootstrap duerfen keine Umleitungen sein")
+        if Path(sys.prefix).resolve() == target:
+            raise ValueError("Die aktive Python-Umgebung darf nicht verschoben werden")
+        if os.path.lexists(str(target)):
+            backup_root.mkdir(exist_ok=True)
+            backup = backup_root / ("venv-backup-" + uuid.uuid4().hex)
+            target.rename(backup)
+            print("VENV_BACKUP: " + str(backup))
+        venv.EnvBuilder(with_pip=True).create(str(target))
+    except Exception as error:
+        print("BOOTSTRAP_ERROR: .venv konnte nicht erstellt werden (" + str(error) + ").")
+        return ExitCode.BOOTSTRAP_ERROR
+    print("VENV_READY: " + str(target))
+    return ExitCode.OK
+
+
 def build_argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -364,6 +409,7 @@ def build_argument_parser():
         default="check-core",
         choices=(
             "check-python",
+            "prepare-venv",
             "check-core",
             "check-ocr",
             "requirements-current",
@@ -377,6 +423,8 @@ def main(argv=None):
     args = build_argument_parser().parse_args(argv)
     if args.command == "check-python":
         code = check_python_version()
+    elif args.command == "prepare-venv":
+        code = prepare_venv(args.project_root)
     elif args.command == "check-core":
         code = check_core(args.project_root)
     elif args.command == "check-ocr":
@@ -389,4 +437,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Redirected Windows logs must remain readable even for Unicode paths and
+    # exception messages. BAT status messages themselves are ASCII.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())
