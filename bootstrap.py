@@ -3,6 +3,8 @@
 The file intentionally uses syntax supported by older Python versions so it can
 print a useful error before the application (which requires Python 3.10) is
 imported. It can create a local venv, but never installs system components.
+Processing needs Tesseract with German language data, a separate system
+install that only ``check-ocr`` verifies; the GUI starts without it.
 """
 
 import argparse
@@ -20,7 +22,9 @@ import venv
 
 MINIMUM_PYTHON = (3, 10)
 PROJECT_ROOT = Path(__file__).resolve().parent
-CORE_DEPENDENCIES = ("pdfplumber",)
+# Mandatory packages from requirements.txt besides PyMuPDF, whose import
+# failures are classified separately by _load_pymupdf().
+CORE_DEPENDENCIES = ("pdfplumber", "PIL.Image")
 CORE_APPLICATION_MODULES = (
     "pdf_extractor",
     "form_parser",
@@ -30,10 +34,17 @@ CORE_APPLICATION_MODULES = (
 )
 DEFAULT_REQUIREMENTS = "requirements.txt"
 DEFAULT_STAMP = ".venv/.requirements.sha256"
+# Official Windows installer linked from the Tesseract documentation
+# (https://tesseract-ocr.github.io/tessdoc/Installation.html).
+TESSERACT_DOWNLOAD_URL = "https://github.com/UB-Mannheim/tesseract/wiki"
 
 
 class ExitCode(IntEnum):
-    """Stable process exit codes consumed by the BAT launchers."""
+    """Stable process exit codes consumed by the BAT launchers.
+
+    30 is retired: it meant "optional OCR Python profile missing". PyMuPDF is
+    a mandatory package now and reports 20/34/35; do not reuse 30.
+    """
 
     OK = 0
     UNSUPPORTED_PYTHON = 10
@@ -42,7 +53,6 @@ class ExitCode(IntEnum):
     APPLICATION_IMPORT_FAILED = 22
     CONFIG_UNREADABLE = 23
     REGISTRY_UNREADABLE = 24
-    OCR_PYTHON_DEPENDENCY_UNAVAILABLE = 30
     TESSERACT_UNAVAILABLE = 31
     OCR_LANGUAGE_DATA_UNAVAILABLE = 32
     OCR_CHECK_FAILED = 33
@@ -148,19 +158,71 @@ def _check_student_registry(project_root):
     return ExitCode.OK
 
 
+def _check_pymupdf():
+    """Report a missing PyMuPDF apart from an installed one that cannot load."""
+
+    try:
+        _load_pymupdf()
+    except ModuleNotFoundError as error:
+        detail = str(error).strip() or error.__class__.__name__
+        print(
+            "CORE_DEPENDENCY_UNAVAILABLE: Pflichtpaket fehlt: PyMuPDF ("
+            + detail
+            + ")."
+        )
+        return ExitCode.CORE_DEPENDENCY_UNAVAILABLE
+    except PyMuPDFImportFailure as error:
+        detail = str(error).strip() or error.__class__.__name__
+        if error.runtime_related:
+            print(
+                "PYMUPDF_RUNTIME_UNAVAILABLE: PyMuPDF ist installiert, aber die "
+                "Windows-Laufzeit (Microsoft Visual C++ Redistributable) fehlt "
+                "oder ist beschaedigt (" + detail + ")."
+            )
+            return ExitCode.PYMUPDF_RUNTIME_UNAVAILABLE
+        print(
+            "PYMUPDF_IMPORT_FAILED: PyMuPDF ist installiert, kann aber nicht "
+            "importiert werden (" + detail + ")."
+        )
+        return ExitCode.PYMUPDF_IMPORT_FAILED
+    return ExitCode.OK
+
+
+def _check_package_imports():
+    code = _import_modules(
+        CORE_DEPENDENCIES,
+        ExitCode.CORE_DEPENDENCY_UNAVAILABLE,
+        "CORE_DEPENDENCY_UNAVAILABLE",
+    )
+    if code != ExitCode.OK:
+        return code
+    return _check_pymupdf()
+
+
+def check_packages(project_root=PROJECT_ROOT):
+    """Check only the mandatory Python packages (used by quick_start.bat)."""
+
+    del project_root  # Kept in the public signature for symmetry and tests.
+    code = check_python_version(emit=False)
+    if code != ExitCode.OK:
+        check_python_version()
+        return code
+    code = _check_package_imports()
+    if code != ExitCode.OK:
+        return code
+    print("PACKAGES_OK: pdfplumber, Pillow und PyMuPDF sind bereit.")
+    return ExitCode.OK
+
+
 def check_core(project_root=PROJECT_ROOT):
-    """Validate everything required to start the application without OCR."""
+    """Validate everything required to start the application (OCR aside)."""
 
     project_root = Path(project_root).resolve()
     code = check_python_version()
     if code != ExitCode.OK:
         return code
 
-    code = _import_modules(
-        CORE_DEPENDENCIES,
-        ExitCode.CORE_DEPENDENCY_UNAVAILABLE,
-        "CORE_DEPENDENCY_UNAVAILABLE",
-    )
+    code = _check_package_imports()
     if code != ExitCode.OK:
         return code
 
@@ -198,7 +260,10 @@ def check_core(project_root=PROJECT_ROOT):
     if code != ExitCode.OK:
         return code
 
-    print("CORE_OK: Importe, tkinter, Konfiguration und Schuelerverzeichnis sind bereit.")
+    print(
+        "CORE_OK: Pakete, tkinter, Anwendungsimporte, Konfiguration und "
+        "Schuelerverzeichnis sind bereit."
+    )
     return ExitCode.OK
 
 
@@ -248,7 +313,11 @@ def _load_pymupdf():
 
 
 def check_ocr(project_root=PROJECT_ROOT):
-    """Check optional Python rendering, Tesseract, and deu/eng language data."""
+    """Check what processing needs: PyMuPDF, Tesseract and deu/eng data.
+
+    Missing ``osd`` data is only a warning: orientation detection merely
+    orders a single retry of an unrecognised page.
+    """
 
     del project_root  # Kept in the public signature for symmetry and tests.
     code = check_python_version(emit=False)
@@ -256,29 +325,9 @@ def check_ocr(project_root=PROJECT_ROOT):
         check_python_version()
         return code
 
-    try:
-        _load_pymupdf()
-    except ModuleNotFoundError as error:
-        detail = str(error).strip() or error.__class__.__name__
-        print(
-            "OCR_PYTHON_DEPENDENCY_UNAVAILABLE: requirements-ocr.txt installieren ("
-            + detail
-            + ")."
-        )
-        return ExitCode.OCR_PYTHON_DEPENDENCY_UNAVAILABLE
-    except PyMuPDFImportFailure as error:
-        detail = str(error).strip() or error.__class__.__name__
-        if error.runtime_related:
-            print(
-                "PYMUPDF_RUNTIME_UNAVAILABLE: PyMuPDF ist installiert, aber die "
-                "Windows-Laufzeit fehlt oder ist beschaedigt (" + detail + ")."
-            )
-            return ExitCode.PYMUPDF_RUNTIME_UNAVAILABLE
-        print(
-            "PYMUPDF_IMPORT_FAILED: PyMuPDF ist installiert, kann aber nicht "
-            "importiert werden (" + detail + ")."
-        )
-        return ExitCode.PYMUPDF_IMPORT_FAILED
+    code = _check_pymupdf()
+    if code != ExitCode.OK:
+        return code
 
     try:
         from ocr import TesseractOCRProvider
@@ -290,7 +339,19 @@ def check_ocr(project_root=PROJECT_ROOT):
         return ExitCode.OCR_CHECK_FAILED
 
     if availability.available:
-        print("OCR_OK: Tesseract und die konfigurierten Sprachdaten sind bereit.")
+        print(
+            "OCR_OK: Tesseract "
+            + str(availability.executable)
+            + " ist bereit; installierte Sprachdaten: "
+            + ", ".join(availability.languages)
+            + "."
+        )
+        if "osd" not in availability.languages:
+            print(
+                "OCR_WARNING_OSD_MISSING: Die Sprachdaten osd fehlen; seitlich "
+                "gedrehte Scans werden schlechter erkannt. Die Verarbeitung "
+                "ist trotzdem moeglich."
+            )
         return ExitCode.OK
 
     message = availability.message
@@ -395,6 +456,23 @@ def prepare_venv(project_root=PROJECT_ROOT):
     return ExitCode.OK
 
 
+def open_tesseract_download():
+    """Open the official installer page after the user agreed in setup.bat."""
+
+    import webbrowser
+
+    try:
+        opened = webbrowser.open(TESSERACT_DOWNLOAD_URL)
+    except Exception as error:  # Browser integration is best effort.
+        print("TESSERACT_GUIDE_NOT_OPENED: " + TESSERACT_DOWNLOAD_URL + " (" + str(error) + ").")
+        return ExitCode.BOOTSTRAP_ERROR
+    if not opened:
+        print("TESSERACT_GUIDE_NOT_OPENED: " + TESSERACT_DOWNLOAD_URL + ".")
+        return ExitCode.BOOTSTRAP_ERROR
+    print("TESSERACT_GUIDE_OPENED: " + TESSERACT_DOWNLOAD_URL + ".")
+    return ExitCode.OK
+
+
 def build_argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -410,8 +488,10 @@ def build_argument_parser():
         choices=(
             "check-python",
             "prepare-venv",
+            "check-packages",
             "check-core",
             "check-ocr",
+            "open-tesseract-download",
             "requirements-current",
             "write-requirements-stamp",
         ),
@@ -425,10 +505,14 @@ def main(argv=None):
         code = check_python_version()
     elif args.command == "prepare-venv":
         code = prepare_venv(args.project_root)
+    elif args.command == "check-packages":
+        code = check_packages(args.project_root)
     elif args.command == "check-core":
         code = check_core(args.project_root)
     elif args.command == "check-ocr":
         code = check_ocr(args.project_root)
+    elif args.command == "open-tesseract-download":
+        code = open_tesseract_download()
     elif args.command == "requirements-current":
         code = requirements_current(args.project_root)
     else:

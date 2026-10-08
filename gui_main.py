@@ -1709,8 +1709,24 @@ class PDFRenamerGUI:
     def run(self):
         self.log_message("🎯 PDF Datei Umbenenner bereit!")
         self.log_message("📌 Wählen Sie Ordner, Monat und Jahr.")
+        self.report_ocr_status()
         self.update_statistics()
         self.root.mainloop()
+
+    def report_ocr_status(self):
+        """Warn at startup that processing stays locked without OCR."""
+
+        ocr_problem = ocr_unavailable_reason(getattr(self, "extractor", None))
+        if not ocr_problem:
+            return
+        self.log_message(f"⚠️ {ocr_problem}")
+        self.log_message(
+            "⚠️ Die Verarbeitung ist gesperrt; Schülerverzeichnis und Prüfung "
+            f"bleiben nutzbar. {OCR_SETUP_HINT}"
+        )
+        self.progress_label.config(
+            text="OCR nicht verfügbar – Verarbeitung gesperrt (siehe Log)"
+        )
 
 
 def main():

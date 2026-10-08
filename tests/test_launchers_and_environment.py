@@ -103,9 +103,10 @@ def test_ocr_health_uses_structured_unavailability_reasons(monkeypatch, capsys):
 def test_ocr_health_distinguishes_pymupdf_failure_classes(monkeypatch, capsys):
     cases = (
         (
+            # PyMuPDF is mandatory now: absence is a missing core package.
             ModuleNotFoundError("PyMuPDF ist nicht installiert"),
-            bootstrap.ExitCode.OCR_PYTHON_DEPENDENCY_UNAVAILABLE,
-            "OCR_PYTHON_DEPENDENCY_UNAVAILABLE",
+            bootstrap.ExitCode.CORE_DEPENDENCY_UNAVAILABLE,
+            "CORE_DEPENDENCY_UNAVAILABLE",
         ),
         (
             bootstrap.PyMuPDFImportFailure(
@@ -128,8 +129,82 @@ def test_ocr_health_distinguishes_pymupdf_failure_classes(monkeypatch, capsys):
             raise current
 
         monkeypatch.setattr(bootstrap, "_load_pymupdf", fail_import)
-        assert bootstrap.check_ocr() == expected_code
-        assert expected_category in capsys.readouterr().out
+        for check in (bootstrap.check_ocr, bootstrap.check_packages):
+            assert check() == expected_code
+            assert expected_category in capsys.readouterr().out
+
+
+def test_core_health_requires_pymupdf_before_application_checks(
+    tmp_path, monkeypatch, capsys
+):
+    _write_health_data(tmp_path)
+
+    def broken_runtime():
+        raise bootstrap.PyMuPDFImportFailure(
+            "DLL load failed while importing _extra", runtime_related=True
+        )
+
+    monkeypatch.setattr(bootstrap, "_load_pymupdf", broken_runtime)
+    assert (
+        bootstrap.check_core(tmp_path)
+        == bootstrap.ExitCode.PYMUPDF_RUNTIME_UNAVAILABLE
+    )
+    assert "Visual C++" in capsys.readouterr().out
+
+
+def test_package_check_reports_missing_pillow(monkeypatch, capsys):
+    real_import = bootstrap.importlib.import_module
+
+    def import_without_pillow(name):
+        if name.startswith("PIL"):
+            raise ModuleNotFoundError("No module named 'PIL'")
+        return real_import(name)
+
+    monkeypatch.setattr(bootstrap.importlib, "import_module", import_without_pillow)
+    assert bootstrap.check_packages() == bootstrap.ExitCode.CORE_DEPENDENCY_UNAVAILABLE
+    assert "PIL.Image" in capsys.readouterr().out
+
+
+def test_package_check_accepts_installed_packages(capsys):
+    assert bootstrap.check_packages() == bootstrap.ExitCode.OK
+    assert "PACKAGES_OK" in capsys.readouterr().out
+
+
+def test_missing_osd_is_only_a_warning(monkeypatch, capsys):
+    class Provider:
+        def __init__(self, languages):
+            self.languages = languages
+
+        def check_availability(self):
+            return OCRAvailability(True, "bereit", Path("tesseract.exe"), self.languages)
+
+    monkeypatch.setattr(bootstrap, "_load_pymupdf", lambda: object())
+    monkeypatch.setattr(ocr, "TesseractOCRProvider", lambda: Provider(("deu", "eng")))
+    assert bootstrap.check_ocr() == bootstrap.ExitCode.OK
+    assert "OCR_WARNING_OSD_MISSING" in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        ocr, "TesseractOCRProvider", lambda: Provider(("deu", "eng", "osd"))
+    )
+    assert bootstrap.check_ocr() == bootstrap.ExitCode.OK
+    output = capsys.readouterr().out
+    assert "OCR_OK" in output and "OSD_MISSING" not in output
+
+
+def test_unreadable_user_data_is_reported_without_changes(tmp_path):
+    def snapshot():
+        return {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+
+    _write_health_data(tmp_path)
+    (tmp_path / "Schuler.csv").write_bytes(b"Nummer;Nachname\n\xff\xfe kaputt;;;\n")
+    before = snapshot()
+    assert bootstrap.check_core(tmp_path) == bootstrap.ExitCode.REGISTRY_UNREADABLE
+    assert snapshot() == before
+
+    (tmp_path / "subjects_config.json").write_text("{kaputt", encoding="utf-8")
+    before = snapshot()
+    assert bootstrap.check_core(tmp_path) == bootstrap.ExitCode.CONFIG_UNREADABLE
+    assert snapshot() == before
 
 
 def test_pymupdf_loader_classifies_windows_runtime_errors(monkeypatch):
@@ -193,9 +268,15 @@ def test_batch_files_are_ascii_and_use_the_local_environment():
     assert "--core-only" in setup
     assert "--force-reinstall --no-cache-dir" in setup
     assert "install_vc_runtime.ps1" in setup
-    assert "ocr_required" not in setup
     assert "auto_vc_runtime" not in setup
-    assert 'if /i "%~1"=="--unattended" goto select_core_only' in setup
+    assert 'if /i "%~1"=="--unattended" goto select_unattended' in setup
+    assert 'if /i "%~1"=="--core-only" goto select_core_only' in setup
+    # Tesseract is checked after the package stamp; only consent opens the
+    # official installer page, no system installer is started silently.
+    assert setup.index("write-requirements-stamp") < setup.index("check-ocr")
+    assert "open-tesseract-download" in setup
+    assert "winget" not in setup
+    assert "requirements-ocr" not in setup + smart
     assert '"%venv_python%" -m pip install' in smart
     assert "requirements-current" in smart
     assert "--health-only" in smart
@@ -217,17 +298,17 @@ def test_quick_start_never_installs_or_repairs_packages():
 
 def test_dependency_groups_are_separate():
     core = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
-    ocr = (PROJECT_ROOT / "requirements-ocr.txt").read_text(encoding="utf-8")
     dev = (PROJECT_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
 
     assert "pdfplumber" in core
     assert "PyInstaller" not in core
     assert "six>=" not in core
-    # Since scan_recognition_v3 every page is OCR-rendered, so the renderer is a
-    # core dependency. It stays in requirements-ocr.txt until the installer
-    # stage replaces the optional OCR branch that repairs it.
+    # Every page is OCR-rendered since scan_recognition_v3: the renderer and
+    # the field cropping library are mandatory; the optional OCR profile and
+    # its requirements-ocr.txt are gone.
     assert "PyMuPDF>=1.27,<1.29" in core
-    assert "PyMuPDF>=1.27,<1.29" in ocr
+    assert "Pillow>=" in core
+    assert not (PROJECT_ROOT / "requirements-ocr.txt").exists()
     assert "pytest" in dev
 
 
@@ -241,3 +322,50 @@ def test_vc_runtime_installer_verifies_publisher_before_execution():
     assert '"/quiet", "/norestart"' in script
     assert "WindowsBuiltInRole" in script
     assert "Invoke-Expression" not in script
+
+
+def test_gui_start_without_ocr_shows_locked_processing():
+    import gui_main
+
+    class Extractor:
+        def __init__(self, available):
+            self.available = available
+
+        def check_ocr_availability(self):
+            return OCRAvailability(self.available, "OCR ist nicht verfügbar: Test.")
+
+    class Label:
+        text = "Bereit zum Starten"
+
+        def config(self, text):
+            self.text = text
+
+    for available, expected_messages in ((False, 2), (True, 0)):
+        gui = gui_main.PDFRenamerGUI.__new__(gui_main.PDFRenamerGUI)
+        messages = []
+        gui.extractor = Extractor(available)
+        gui.log_message = messages.append
+        gui.progress_label = Label()
+        gui.report_ocr_status()
+        assert len(messages) == expected_messages
+        if not available:
+            assert "OCR ist nicht verfügbar: Test." in messages[0]
+            assert "Verarbeitung ist gesperrt" in messages[1]
+            assert "setup.bat" in messages[1]
+            assert "Verarbeitung gesperrt" in gui.progress_label.text
+        else:
+            assert gui.progress_label.text == "Bereit zum Starten"
+
+
+def test_per_user_tesseract_is_found_without_path(tmp_path, monkeypatch):
+    executable = tmp_path / "Programs" / "Tesseract-OCR" / "tesseract.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"")
+    monkeypatch.delenv("TESSERACT_CMD", raising=False)
+    monkeypatch.setattr(ocr.shutil, "which", lambda name: None)
+    for name in ("ProgramFiles", "ProgramFiles(x86)"):
+        monkeypatch.setenv(name, str(tmp_path / "missing"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    found = ocr.TesseractOCRProvider()._find_executable()
+    assert found == executable.resolve()

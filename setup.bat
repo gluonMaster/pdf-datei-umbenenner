@@ -7,17 +7,17 @@ set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
 set "LOG_DIR=%~dp0.launcher-logs"
 set "LOG_FILE=%~dp0.launcher-logs\setup.log"
 set "SETUP_MODE=interactive"
-set "INSTALL_OCR=prompt"
-set "OCR_READY=0"
-set "OCR_REINSTALL_ATTEMPTED=0"
+set "CORE_REPAIR_ATTEMPTED=0"
 set "VC_RUNTIME_ATTEMPTED=0"
+set "TESSERACT_GUIDE_OFFERED=0"
+set "OCR_STATE=unchecked"
 set "PYTHONIOENCODING=utf-8"
 rem The new Python install manager must not download a runtime implicitly.
 set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"
 
 :parse_arguments
 if "%~1"=="" goto arguments_done
-if /i "%~1"=="--unattended" goto select_core_only
+if /i "%~1"=="--unattended" goto select_unattended
 if /i "%~1"=="--core-only" goto select_core_only
 if /i "%~1"=="--help" goto show_usage
 if /i "%~1"=="-h" goto show_usage
@@ -25,19 +25,28 @@ echo FEHLER: Unbekannter Parameter: %~1
 echo Verwenden Sie setup.bat --help fuer die Aufrufhilfe.
 exit /b 64
 
+:select_unattended
+set "SETUP_MODE=unattended"
+shift
+goto parse_arguments
+
 :select_core_only
 set "SETUP_MODE=core-only"
-set "INSTALL_OCR=no"
 shift
 goto parse_arguments
 
 :show_usage
 echo Aufruf:
-echo   setup.bat                 Interaktives Setup; OCR ist optional.
-echo   setup.bat --unattended    Alias fuer --core-only; keine Systeminstallation.
-echo   setup.bat --core-only     Ohne Rueckfragen; nur Kernanwendung.
+echo   setup.bat                 Interaktiv: Python-Pakete installieren, Tesseract OCR
+echo                             mit deutschen Sprachdaten pruefen, bei Bedarf Anleitung.
+echo   setup.bat --unattended    Ohne Rueckfragen und ohne Systeminstallation. Erfolg nur,
+echo                             wenn Pakete, Tesseract und Sprachdaten deu bereit sind.
+echo   setup.bat --core-only     Nur Python-Pakete; Tesseract wird nicht geprueft.
+echo                             Die Verarbeitung von PDF-Dateien benoetigt ihn trotzdem.
 echo.
-echo OCR wird nur im interaktiven Setup nach Bestaetigung installiert.
+echo Rueckgabecodes: 0 bereit; 31 Tesseract fehlt; 32 Sprachdaten deu oder eng fehlen;
+echo 33 OCR-Pruefung fehlgeschlagen; 34 Microsoft VC++ Laufzeit fuer PyMuPDF fehlt.
+echo Alle Codes stehen in README.md.
 exit /b 0
 
 :arguments_done
@@ -61,8 +70,11 @@ echo ================================================================
 echo   PDF Datei Umbenenner - Setup
 echo ================================================================
 echo.
-echo Dieses Setup erstellt ein privates .venv im Anwendungsverzeichnis.
-echo Fuer die Kernanwendung sind keine Administratorrechte erforderlich.
+echo Dieses Setup erstellt ein privates .venv im Anwendungsverzeichnis und
+echo installiert die Python-Pakete; dafuer sind keine Administratorrechte noetig.
+echo Fuer die Verarbeitung wird zusaetzlich Tesseract OCR mit deutschen
+echo Sprachdaten benoetigt. Das Setup prueft ihn ausser mit --core-only und
+echo erklaert die Einrichtung.
 echo Diagnoselog: "%LOG_FILE%"
 echo.
 
@@ -98,81 +110,48 @@ if not exist "%VENV_PYTHON%" (
     goto critical_failure
 )
 
-echo [3/5] Erforderliche Kernabhaengigkeiten werden installiert...
+echo [3/5] Erforderliche Python-Pakete werden installiert...
 "%VENV_PYTHON%" -m ensurepip --upgrade >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto ensurepip_failed
 "%VENV_PYTHON%" -m pip install --disable-pip-version-check -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto pip_failed
 
-echo Kernpruefung wird ausgefuehrt...
+:run_core_check
+echo Paket- und Kernpruefung wird ausgefuehrt...
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
-if "%ERRORLEVEL%"=="20" goto repair_core_imports
-if "%ERRORLEVEL%"=="22" goto repair_core_imports
-if errorlevel 1 goto health_failed
-goto stamp_core
+set "CORE_CODE=%ERRORLEVEL%"
+if "%CORE_CODE%"=="0" goto stamp_core
+if "%CORE_CODE%"=="20" goto repair_core_packages
+if "%CORE_CODE%"=="22" goto repair_core_packages
+if "%CORE_CODE%"=="34" goto repair_core_packages
+if "%CORE_CODE%"=="35" goto repair_core_packages
+goto core_failed
 
-:repair_core_imports
-echo Beschaedigte Kernpakete werden einmal neu installiert...
+:repair_core_packages
+if "%CORE_REPAIR_ATTEMPTED%"=="1" goto core_repair_exhausted
+set "CORE_REPAIR_ATTEMPTED=1"
+echo Beschaedigte Pakete werden einmal ohne Paket-Cache neu installiert...
 "%VENV_PYTHON%" -m pip install --disable-pip-version-check --force-reinstall --no-cache-dir -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto pip_failed
-"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto health_failed
+goto run_core_check
 
-:stamp_core
-"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" write-requirements-stamp >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto stamp_failed
-echo OK: Die Kernanwendung ist bereit.
-
-echo [4/5] Optionale OCR-Unterstuetzung...
-if /i "%INSTALL_OCR%"=="no" goto skip_ocr
-set "OCR_CHOICE="
-set /p "OCR_CHOICE=Optionale Python-OCR-Unterstuetzung installieren? [j/N]: "
-if /i "%OCR_CHOICE%"=="Y" goto install_ocr
-if /i "%OCR_CHOICE%"=="YES" goto install_ocr
-if /i "%OCR_CHOICE%"=="J" goto install_ocr
-if /i "%OCR_CHOICE%"=="JA" goto install_ocr
-
-:skip_ocr
-echo OCR wurde nicht ausgewaehlt. Die Kernanwendung bleibt voll nutzbar.
-goto optional_actions
-
-:install_ocr
-set "OCR_REINSTALL_ATTEMPTED=0"
-set "VC_RUNTIME_ATTEMPTED=0"
-echo Optionale Python-OCR-Abhaengigkeiten werden installiert...
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check -r "%PROJECT_DIR%requirements-ocr.txt" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto repair_ocr_python
-goto run_ocr_health
-
-:repair_ocr_python
-if "%OCR_REINSTALL_ATTEMPTED%"=="1" goto ocr_python_failed
-set "OCR_REINSTALL_ATTEMPTED=1"
-echo PyMuPDF wird ohne Paket-Cache neu installiert...
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check --upgrade --force-reinstall --no-cache-dir -r "%PROJECT_DIR%requirements-ocr.txt" >>"%LOG_FILE%" 2>&1
-if errorlevel 1 goto ocr_python_failed
-goto run_ocr_health
-
-:run_ocr_health
-"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-ocr >>"%LOG_FILE%" 2>&1
-set "OCR_CHECK_CODE=%ERRORLEVEL%"
-if "%OCR_CHECK_CODE%"=="0" goto ocr_ready
-if "%OCR_CHECK_CODE%"=="30" goto repair_ocr_python
-if "%OCR_CHECK_CODE%"=="35" goto repair_ocr_python
-if "%OCR_CHECK_CODE%"=="34" goto handle_pymupdf_runtime
-goto ocr_external_failed
+:core_repair_exhausted
+if "%CORE_CODE%"=="34" goto handle_pymupdf_runtime
+goto core_failed
 
 :handle_pymupdf_runtime
-if "%OCR_REINSTALL_ATTEMPTED%"=="0" goto repair_ocr_python
-if "%VC_RUNTIME_ATTEMPTED%"=="1" goto ocr_unavailable
 echo PyMuPDF benoetigt die aktuelle Microsoft Visual C++ Windows-Laufzeit.
+if /i not "%SETUP_MODE%"=="interactive" goto pymupdf_runtime_missing
+if "%VC_RUNTIME_ATTEMPTED%"=="1" goto pymupdf_runtime_missing
 echo Das Microsoft-Paket wird nur nach gueltiger digitaler Signatur ausgefuehrt.
+echo Dafuer muss diese Konsole als Administrator gestartet sein.
 set "VC_RUNTIME_CHOICE="
 set /p "VC_RUNTIME_CHOICE=VC++ Redistributable automatisch installieren? [j/N]: "
 if /i "%VC_RUNTIME_CHOICE%"=="Y" goto install_vc_runtime
 if /i "%VC_RUNTIME_CHOICE%"=="YES" goto install_vc_runtime
 if /i "%VC_RUNTIME_CHOICE%"=="J" goto install_vc_runtime
 if /i "%VC_RUNTIME_CHOICE%"=="JA" goto install_vc_runtime
-goto ocr_unavailable
+goto pymupdf_runtime_missing
 
 :install_vc_runtime
 set "VC_RUNTIME_ATTEMPTED=1"
@@ -189,75 +168,101 @@ echo Microsoft Visual C++ Redistributable wird sicher installiert...
 "%POWERSHELL_COMMAND%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PROJECT_DIR%install_vc_runtime.ps1" >>"%LOG_FILE%" 2>&1
 set "VC_RUNTIME_CODE=%ERRORLEVEL%"
 if not "%VC_RUNTIME_CODE%"=="0" goto vc_runtime_failed
-goto run_ocr_health
+goto run_core_check
 
 :powershell_unavailable
-set "OCR_CHECK_CODE=60"
 echo FEHLER: PowerShell ist fuer die sichere Windows-Laufzeitinstallation erforderlich.
-goto ocr_unavailable
+goto pymupdf_runtime_missing
 
 :vc_runtime_failed
-set "OCR_CHECK_CODE=%VC_RUNTIME_CODE%"
-echo FEHLER: Die Microsoft VC++ Laufzeit konnte nicht automatisch eingerichtet werden.
-goto ocr_unavailable
+echo FEHLER: Die Microsoft VC++ Laufzeit konnte nicht automatisch eingerichtet werden. Code: %VC_RUNTIME_CODE%.
+goto pymupdf_runtime_missing
 
-:ocr_python_failed
-set "OCR_CHECK_CODE=30"
-echo FEHLER: PyMuPDF konnte auch nach der automatischen Neuinstallation nicht geladen werden.
-goto ocr_unavailable
+:pymupdf_runtime_missing
+set "FAIL_CODE=34"
+echo FEHLER: PyMuPDF kann ohne die Microsoft VC++ Laufzeit nicht geladen werden.
+echo Abhilfe: setup.bat ohne Parameter in einer Administrator-Konsole ausfuehren
+echo oder das Microsoft Visual C++ Redistributable installieren.
+goto critical_failure
 
-:ocr_external_failed
-if "%OCR_CHECK_CODE%"=="31" goto tesseract_unavailable
-if "%OCR_CHECK_CODE%"=="32" goto tesseract_languages_unavailable
-echo FEHLER: Die OCR-Gesamtpruefung ist fehlgeschlagen. Rueckgabecode: %OCR_CHECK_CODE%.
-goto ocr_unavailable
+:core_failed
+set "FAIL_CODE=%CORE_CODE%"
+echo FEHLER: Die erforderliche Kernpruefung ist fehlgeschlagen. Code: %CORE_CODE%.
+if "%CORE_CODE%"=="21" echo tkinter/Tcl fehlt: Python mit Tcl/Tk-Unterstuetzung reparieren.
+if "%CORE_CODE%"=="23" echo subjects_config.json ist unlesbar. Die Datei wird nicht veraendert.
+if "%CORE_CODE%"=="24" echo Schuler.csv fehlt oder ist unlesbar. Die Datei wird nicht veraendert.
+goto critical_failure
 
-:tesseract_unavailable
-echo FEHLER: Tesseract wurde nicht gefunden.
-goto offer_tesseract_instructions
+:stamp_core
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" write-requirements-stamp >>"%LOG_FILE%" 2>&1
+if errorlevel 1 goto stamp_failed
+echo OK: Python-Pakete und Kernpruefung sind bereit.
 
-:tesseract_languages_unavailable
-echo FEHLER: Die Tesseract-Sprachdaten deu und/oder eng fehlen.
-goto offer_tesseract_instructions
+if /i "%SETUP_MODE%"=="core-only" goto skip_ocr_check
+echo [4/5] Tesseract OCR mit deutschen Sprachdaten wird geprueft...
 
-:ocr_unavailable
-echo WARNUNG: OCR ist nicht vollstaendig verfuegbar. Der Kernstart ist nicht betroffen.
-echo Details und der maschinenlesbare Grund stehen im Diagnoselog.
+:run_ocr_check
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-ocr >>"%LOG_FILE%" 2>&1
+set "OCR_CHECK_CODE=%ERRORLEVEL%"
+if "%OCR_CHECK_CODE%"=="0" goto ocr_ready
+call :describe_ocr_problem
+if /i not "%SETUP_MODE%"=="interactive" goto ocr_missing
+if "%TESSERACT_GUIDE_OFFERED%"=="1" goto ocr_missing
+goto offer_tesseract_setup
+
+:skip_ocr_check
+set "OCR_STATE=skipped"
+echo [4/5] Tesseract wird im Modus --core-only nicht geprueft.
+echo HINWEIS: Die Verarbeitung von PDF-Dateien benoetigt Tesseract OCR mit deutschen
+echo Sprachdaten deu. Ohne Tesseract startet die Anwendung, die Verarbeitung bleibt
+echo aber gesperrt. Pruefung und Anleitung: setup.bat ohne Parameter.
 goto optional_actions
 
 :ocr_ready
-set "OCR_READY=1"
-echo OK: OCR-Renderer, Tesseract und Sprachdaten sind bereit.
+set "OCR_STATE=ready"
+echo OK: Tesseract OCR mit deutschen Sprachdaten ist bereit.
 goto optional_actions
 
-:offer_tesseract_instructions
+:offer_tesseract_setup
+set "TESSERACT_GUIDE_OFFERED=1"
 echo.
-echo Tesseract ist eine separate Systemkomponente und kann IT-Freigabe erfordern.
-echo Der interaktive Modus installiert sie nicht still und fordert keine hoeheren Rechte an.
+echo Einrichtung mit dem offiziellen Windows-Installer der UB Mannheim:
+echo   1. Download-Seite oeffnen: https://github.com/UB-Mannheim/tesseract/wiki
+echo      und den aktuellen 64-Bit-Installer tesseract-ocr-w64-setup herunterladen.
+echo   2. Installer starten und den vorgeschlagenen Installationsordner beibehalten.
+echo   3. In der Komponentenauswahl unter "Additional language data" den Eintrag
+echo      "German" ankreuzen. Englisch und osd sind standardmaessig enthalten.
+echo   4. Ist Tesseract schon installiert und fehlt nur deu: Installer erneut starten
+echo      und German nachwaehlen oder deu.traineddata aus
+echo      https://github.com/tesseract-ocr/tessdata in den Ordner tessdata kopieren.
+echo   5. Bei einem anderen Installationsordner die Umgebungsvariable TESSERACT_CMD
+echo      auf den vollstaendigen Pfad von tesseract.exe setzen.
+echo Die Installation fuehren Sie selbst aus; das Setup installiert nichts still.
 set "OPEN_TESSERACT_GUIDE="
-set /p "OPEN_TESSERACT_GUIDE=Separate Tesseract-Systeminstallation vorbereiten (offizielle Anleitung oeffnen)? [j/N]: "
+set /p "OPEN_TESSERACT_GUIDE=Download-Seite jetzt im Browser oeffnen? [j/N]: "
 if /i "%OPEN_TESSERACT_GUIDE%"=="Y" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="YES" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="J" goto open_tesseract_guide
 if /i "%OPEN_TESSERACT_GUIDE%"=="JA" goto open_tesseract_guide
-goto ocr_unavailable
+goto ocr_missing
 
 :open_tesseract_guide
-start "" "https://tesseract-ocr.github.io/tessdoc/Installation.html"
-echo Installieren Sie bei Freigabe Tesseract sowie die Sprachdaten deu und eng.
+"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" open-tesseract-download >>"%LOG_FILE%" 2>&1
+if errorlevel 1 echo Die Seite konnte nicht geoeffnet werden. Bitte die Adresse oben manuell aufrufen.
 set "OCR_CONTINUE="
-set /p "OCR_CONTINUE=Nach Abschluss oder Abbruch der Systemeinrichtung ENTER druecken: "
-goto recheck_ocr
+set /p "OCR_CONTINUE=Nach Abschluss oder Abbruch der Installation ENTER druecken: "
+echo Tesseract wird erneut geprueft...
+goto run_ocr_check
 
-:recheck_ocr
-"%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-ocr >>"%LOG_FILE%" 2>&1
-set "OCR_CHECK_CODE=%ERRORLEVEL%"
-if not "%OCR_CHECK_CODE%"=="0" goto ocr_unavailable
-goto ocr_ready
+:ocr_missing
+set "OCR_STATE=missing"
+set "FAIL_CODE=%OCR_CHECK_CODE%"
+echo Die Verarbeitung von PDF-Dateien ist nicht verfuegbar.
+goto optional_actions
 
 :optional_actions
 echo [5/5] Optionale Komfortfunktionen...
-if /i not "%SETUP_MODE%"=="interactive" goto setup_success
+if /i not "%SETUP_MODE%"=="interactive" goto setup_finished
 set "SHORTCUT_CHOICE="
 set /p "SHORTCUT_CHOICE=Desktop-Verknuepfung erstellen? [j/N]: "
 if /i "%SHORTCUT_CHOICE%"=="Y" call "%PROJECT_DIR%create_desktop_shortcut.bat" --no-pause
@@ -271,12 +276,12 @@ if /i "%TEST_CHOICE%"=="Y" goto test_run
 if /i "%TEST_CHOICE%"=="YES" goto test_run
 if /i "%TEST_CHOICE%"=="J" goto test_run
 if /i "%TEST_CHOICE%"=="JA" goto test_run
-goto setup_success
+goto setup_finished
 
 :test_run
 "%VENV_PYTHON%" "%PROJECT_DIR%start_gui.py" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto test_failed
-goto setup_success
+goto setup_finished
 
 :ensurepip_failed
 set "FAIL_CODE=%ERRORLEVEL%"
@@ -286,11 +291,6 @@ goto critical_failure
 :pip_failed
 set "FAIL_CODE=%ERRORLEVEL%"
 echo FEHLER: Erforderliche Abhaengigkeiten konnten nicht installiert werden.
-goto critical_failure
-
-:health_failed
-set "FAIL_CODE=%ERRORLEVEL%"
-echo FEHLER: Die erforderliche Kernpruefung ist fehlgeschlagen.
 goto critical_failure
 
 :stamp_failed
@@ -317,16 +317,31 @@ if /i "%OPEN_PYTHON_GUIDE%"=="J" start "" "https://www.python.org/downloads/wind
 if /i "%OPEN_PYTHON_GUIDE%"=="JA" start "" "https://www.python.org/downloads/windows/"
 goto critical_failure
 
-:setup_success
+:setup_finished
+if "%OCR_STATE%"=="missing" goto setup_incomplete
 echo.
 echo ================================================================
 echo   SETUP ABGESCHLOSSEN
 echo ================================================================
-if "%OCR_READY%"=="1" echo Kernpruefung und OCR-Pruefung sind OK.
-if not "%OCR_READY%"=="1" echo Die Kernpruefung ist OK. OCR wurde nicht aktiviert.
+if "%OCR_STATE%"=="ready" echo Python-Pakete, Kernpruefung und Tesseract mit deutschen Sprachdaten sind bereit.
+if "%OCR_STATE%"=="skipped" echo Python-Pakete und Kernpruefung sind bereit. Tesseract wurde nicht geprueft;
+if "%OCR_STATE%"=="skipped" echo die Verarbeitung benoetigt Tesseract OCR mit deutschen Sprachdaten deu.
 echo Fuer den Alltag start_app.bat verwenden.
 echo Diagnoselog: "%LOG_FILE%"
 exit /b 0
+
+:setup_incomplete
+echo.
+echo ================================================================
+echo   SETUP UNVOLLSTAENDIG: VERARBEITUNG NICHT VERFUEGBAR
+echo ================================================================
+echo Die Python-Pakete sind installiert. Die Anwendung startet; Schuelerverzeichnis
+echo und Pruefliste sind nutzbar. PDF-Dateien koennen erst verarbeitet werden, wenn
+echo Tesseract OCR mit deutschen Sprachdaten deu eingerichtet ist. Danach setup.bat
+echo erneut ausfuehren.
+echo Rueckgabecode: %FAIL_CODE%.
+echo Diagnoselog: "%LOG_FILE%"
+exit /b %FAIL_CODE%
 
 :critical_failure
 if not defined FAIL_CODE set "FAIL_CODE=1"
@@ -334,6 +349,14 @@ echo.
 echo SETUP FEHLGESCHLAGEN. Rueckgabecode: %FAIL_CODE%.
 echo Diagnoselog: "%LOG_FILE%"
 exit /b %FAIL_CODE%
+
+:describe_ocr_problem
+if "%OCR_CHECK_CODE%"=="31" echo FEHLER: Tesseract OCR wurde nicht gefunden.
+if "%OCR_CHECK_CODE%"=="31" exit /b 0
+if "%OCR_CHECK_CODE%"=="32" echo FEHLER: Tesseract ist installiert, aber die Sprachdaten deu oder eng fehlen.
+if "%OCR_CHECK_CODE%"=="32" exit /b 0
+echo FEHLER: Die OCR-Pruefung ist fehlgeschlagen. Code: %OCR_CHECK_CODE%. Details im Diagnoselog.
+exit /b 0
 
 :find_supported_python
 set "BASE_PYTHON="

@@ -225,8 +225,8 @@ class TesseractOCRProvider(OCRProvider):
         except ImportError:
             return OCRAvailability(
                 False,
-                "OCR ist nicht verfügbar: Der optionale PyMuPDF-Renderer ist nicht "
-                "installiert (requirements-ocr.txt installieren).",
+                "OCR ist nicht verfügbar: Der PyMuPDF-Renderer fehlt oder kann "
+                "nicht geladen werden (start_app.bat repariert die Python-Pakete).",
                 executable,
             )
         del module
@@ -450,10 +450,18 @@ class TesseractOCRProvider(OCRProvider):
         if path_match:
             candidates.append(Path(path_match))
 
-        for environment_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        for environment_name, subfolder in (
+            ("ProgramFiles", ""),
+            ("ProgramFiles(x86)", ""),
+            # Per-user installations do not necessarily extend PATH.
+            ("LOCALAPPDATA", "Programs"),
+            ("LOCALAPPDATA", ""),
+        ):
             root = os.environ.get(environment_name)
             if root:
-                candidates.append(Path(root) / "Tesseract-OCR" / "tesseract.exe")
+                candidates.append(
+                    Path(root) / subfolder / "Tesseract-OCR" / "tesseract.exe"
+                )
 
         seen: set[str] = set()
         for candidate in candidates:

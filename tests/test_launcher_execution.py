@@ -15,14 +15,24 @@ import bootstrap
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = pytest.mark.skipif(os.name != "nt", reason="Windows BAT launchers")
+# Synthetic user data. Launchers must never rewrite it, also on updates.
+USER_DATA = {
+    "Schuler.csv": "Nummer;Nachname;Vorname\n1;Beispiel;Lena\n",
+    "student_aliases.json": '{"aliases": []}',
+    "subjects_config.json": '{"subjects": ["Mathematik"], "aliases": {}}',
+    "subjects_aliases.json": "{}",
+    "manual_review.json": '{"review_items": []}',
+}
 
 
 @pytest.fixture
 def launcher_project(tmp_path):
-    root = tmp_path / "App space & (test)! O'Brien"
+    root = tmp_path / "App space & (test)! O'Brien \u00dcbung \u0141\u00f3d\u017a"
     root.mkdir()
     for name in ("setup.bat", "start_app.bat", "quick_start.bat"):
         shutil.copy2(ROOT / name, root / name)
+    for name, content in USER_DATA.items():
+        (root / name).write_text(content, encoding="utf-8")
     venv.EnvBuilder(with_pip=False).create(root / ".venv")
     # Keep the actual BAT/parser and Python executable; replace only the
     # external operations so failures and optional branches are deterministic.
@@ -48,15 +58,18 @@ def launcher_project(tmp_path):
         "    sys.exit(module.prepare_venv(root))\n"
         "if command == 'write-requirements-stamp':\n"
         "    state['requirements-current'] = 0\n    save()\n"
+        # The operator installs Tesseract while setup waits for ENTER.
+        "if command == 'open-tesseract-download' and state.get('installer-adds-ocr'):\n"
+        "    state['check-ocr'] = 0\n    save()\n"
         "print(command + ': simulated diagnostic')\n"
         "sys.exit(state.get(command, 0))\n",
         encoding="utf-8",
     )
     (root / "pip.py").write_text(
         "from probe import *\nrecord('pip')\n"
-        "optional = any('requirements-ocr.txt' in arg for arg in sys.argv)\n"
-        "code = state.get('ocr-pip-exit' if optional else 'pip-exit', 0)\n"
-        "if not code and '--force-reinstall' in sys.argv and not optional:\n"
+        "code = state.get('pip-exit', 0)\n"
+        # A forced reinstall repairs broken wheels, not a missing VC++ runtime.
+        "if not code and '--force-reinstall' in sys.argv and state.get('check-core') in (20, 22, 35):\n"
         "    state['check-core'] = 0\n    save()\n"
         "print('pip: simulated install')\nsys.exit(code)\n",
         encoding="utf-8",
@@ -68,7 +81,8 @@ def launcher_project(tmp_path):
         "from probe import *\nrecord('gui')\nsys.exit(state.get('gui-exit', 0))\n",
         encoding="ascii",
     )
-    (root / "state.json").write_text('{"check-ocr": 31}', encoding="ascii")
+    # Healthy by default: packages, data, Tesseract with deu.
+    (root / "state.json").write_text("{}", encoding="ascii")
     return root
 
 
@@ -81,7 +95,7 @@ def run_bat(root, name, args="", answers="", state=None, env=None):
         f'"{comspec}" /d /v:off /s /c ""{root / name}" {args}"',
         cwd=root.parent,  # Double-click/shortcut callers need not be in the app.
         input=answers, text=True, encoding="utf-8", errors="replace",
-        capture_output=True, env=env, timeout=45,
+        capture_output=True, env=env, timeout=60,
     )
     return result
 
@@ -91,36 +105,73 @@ def calls(root):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
 
+def kinds(root):
+    return [c[0] for c in calls(root)]
+
+
+def user_data(root):
+    return {name: (root / name).read_bytes() for name in USER_DATA}
+
+
+def assert_local_environment(root):
+    for kind, _, prefix, cwd in calls(root):
+        if kind != "prepare-venv":  # Runs with the base Python by design.
+            assert Path(prefix) == root / ".venv", kind
+        assert Path(cwd) == root, kind
+
+
 @WINDOWS
 def test_healthy_repeated_start_uses_only_venv_and_never_pip(launcher_project):
     root = launcher_project
     for _ in range(2):
         result = run_bat(root, "start_app.bat")
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "WARNUNG: OCR" in result.stdout
-    recorded = calls(root)
-    assert [c[0] for c in recorded].count("gui") == 2
-    assert not any(c[0] in ("pip", "ensurepip", "prepare-venv") for c in recorded)
-    assert all(Path(c[2]) == root / ".venv" and Path(c[3]) == root for c in recorded)
+        assert "OK: Tesseract OCR" in result.stdout
+        assert "WARNUNG" not in result.stdout
+    assert kinds(root).count("gui") == 2
+    assert not any(k in ("pip", "ensurepip", "prepare-venv") for k in kinds(root))
+    assert_local_environment(root)
 
 
 @WINDOWS
 @pytest.mark.parametrize("state,force", [
     ({"requirements-current": 40}, False),
     ({"check-core": 20}, True),
+    ({"check-core": 35}, True),
     ({"requirements-current": 40, "check-core": 20}, True),
 ])
 def test_smart_repairs_changed_or_broken_packages_once(launcher_project, state, force):
     root = launcher_project
+    before = user_data(root)
     result = run_bat(root, "start_app.bat", "--health-only", state=state)
     assert result.returncode == 0, result.stdout + result.stderr
     installs = [c for c in calls(root) if c[0] == "pip"]
     assert installs
     assert any("--force-reinstall" in c[1] for c in installs) == force
+    order = kinds(root)
+    last_core_check = max(i for i, kind in enumerate(order) if kind == "check-core")
+    assert order.index("write-requirements-stamp") > last_core_check
     result = run_bat(root, "start_app.bat", "--health-only")
     assert result.returncode == 0
     assert len([c for c in calls(root) if c[0] == "pip"]) == len(installs)
     assert not any(c[0] == "gui" for c in calls(root))
+    assert user_data(root) == before
+
+
+@WINDOWS
+def test_updated_requirements_install_once_and_keep_user_data(launcher_project):
+    root = launcher_project
+    before = user_data(root)
+    result = run_bat(root, "start_app.bat", state={"requirements-current": 40})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "requirements.txt wurde geaendert" in result.stdout
+    pip_calls = [c for c in calls(root) if c[0] == "pip"]
+    assert len(pip_calls) == 1 and "--force-reinstall" not in pip_calls[0][1]
+    assert any("requirements.txt" in arg for arg in pip_calls[0][1])
+    order = kinds(root)
+    assert order.index("pip") < order.index("write-requirements-stamp") < order.index("gui")
+    assert user_data(root) == before
+    assert_local_environment(root)
 
 
 @WINDOWS
@@ -137,30 +188,139 @@ def test_pip_failure_preserves_code_and_never_reports_success(launcher_project, 
 @WINDOWS
 @pytest.mark.parametrize("code", [21, 23, 24])
 def test_tkinter_or_data_failure_does_not_install(launcher_project, code):
+    before = user_data(launcher_project)
     result = run_bat(launcher_project, "start_app.bat", state={"check-core": code})
     assert result.returncode == code
     assert not any(c[0] in ("pip", "gui") for c in calls(launcher_project))
+    assert user_data(launcher_project) == before
 
 
 @WINDOWS
-@pytest.mark.parametrize("args,answers", [("", "N\nN\nN\n"), ("--core-only", ""), ("--unattended", "")])
-def test_setup_ocr_declined_is_success_without_optional_installs(launcher_project, args, answers):
-    result = run_bat(launcher_project, "setup.bat", args, answers)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "SETUP ABGESCHLOSSEN" in result.stdout
-    assert not any(c[0] in ("check-ocr", "gui") for c in calls(launcher_project))
-    assert len([c for c in calls(launcher_project) if c[0] == "pip"]) == 1
+@pytest.mark.parametrize("code", [23, 24])
+def test_setup_reports_data_errors_without_reinstall_or_stamp(launcher_project, code):
+    root = launcher_project
+    before = user_data(root)
+    result = run_bat(root, "setup.bat", "--unattended", state={"check-core": code})
+    assert result.returncode == code, result.stdout + result.stderr
+    assert "nicht veraendert" in result.stdout
+    assert kinds(root).count("pip") == 1
+    assert not any(k in ("write-requirements-stamp", "check-ocr") for k in kinds(root))
+    assert user_data(root) == before
 
 
 @WINDOWS
-@pytest.mark.parametrize("state", [
-    {"ocr-pip-exit": 18}, {"check-ocr": 31}, {"check-ocr": 32}, {"check-ocr": 34},
-])
-def test_optional_ocr_failures_and_declined_system_install_leave_core_ready(launcher_project, state):
-    result = run_bat(launcher_project, "setup.bat", answers="Y\nN\nN\nN\n", state=state)
+def test_clean_setup_with_tesseract_succeeds_and_stamps_after_checks(launcher_project):
+    root = launcher_project
+    shutil.rmtree(root / ".venv")
+    result = run_bat(root, "setup.bat", answers="N\nN\n")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SETUP ABGESCHLOSSEN" in result.stdout
-    assert "OCR wurde nicht aktiviert" in result.stdout
+    assert "Tesseract mit deutschen Sprachdaten sind bereit" in result.stdout
+    assert kinds(root) == [
+        "prepare-venv", "ensurepip", "pip", "check-core",
+        "write-requirements-stamp", "check-ocr",
+    ]
+    assert (root / ".venv" / "pyvenv.cfg").exists()
+    assert_local_environment(root)
+
+
+@WINDOWS
+@pytest.mark.parametrize("args", ["", "--unattended"])
+def test_setup_with_ready_environment_reports_success(launcher_project, args):
+    result = run_bat(launcher_project, "setup.bat", args, answers="N\nN\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SETUP ABGESCHLOSSEN" in result.stdout
+    assert kinds(launcher_project).count("check-ocr") == 1
+
+
+@WINDOWS
+@pytest.mark.parametrize("code,reason", [(31, "nicht gefunden"), (32, "Sprachdaten deu")])
+def test_interactive_setup_declined_tesseract_ends_with_distinct_code(launcher_project, code, reason):
+    root = launcher_project
+    result = run_bat(root, "setup.bat", answers="N\nN\nN\n", state={"check-ocr": code})
+    assert result.returncode == code, result.stdout + result.stderr
+    assert reason in result.stdout
+    assert "German" in result.stdout and "UB-Mannheim" in result.stdout
+    assert "VERARBEITUNG NICHT VERFUEGBAR" in result.stdout
+    assert "SETUP ABGESCHLOSSEN" not in result.stdout
+    assert kinds(root).count("check-ocr") == 1
+    assert "open-tesseract-download" not in kinds(root)
+    # Packages are ready, so start_app must not reinstall them later.
+    assert "write-requirements-stamp" in kinds(root)
+
+
+@WINDOWS
+def test_interactive_setup_rechecks_after_consented_guide(launcher_project):
+    root = launcher_project
+    result = run_bat(root, "setup.bat", answers="J\n\nN\nN\n", state={"check-ocr": 31})
+    assert result.returncode == 31, result.stdout + result.stderr
+    order = kinds(root)
+    assert order.count("check-ocr") == 2
+    assert order.index("check-ocr") < order.index("open-tesseract-download")
+    assert "erneut geprueft" in result.stdout
+
+    (root / "calls.jsonl").unlink()
+    result = run_bat(
+        root, "setup.bat", answers="J\n\nN\nN\n",
+        state={"check-ocr": 32, "installer-adds-ocr": True},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SETUP ABGESCHLOSSEN" in result.stdout
+    assert kinds(root).count("check-ocr") == 2
+
+
+@WINDOWS
+@pytest.mark.parametrize("code", [31, 32, 33])
+def test_unattended_setup_without_tesseract_fails_without_questions(launcher_project, code):
+    root = launcher_project
+    result = run_bat(root, "setup.bat", "--unattended", state={"check-ocr": code})
+    assert result.returncode == code, result.stdout + result.stderr
+    assert "[j/N]" not in result.stdout
+    assert "SETUP ABGESCHLOSSEN" not in result.stdout
+    assert "VERARBEITUNG NICHT VERFUEGBAR" in result.stdout
+    assert not any(k in ("open-tesseract-download", "gui") for k in kinds(root))
+    assert kinds(root).count("pip") == 1
+
+
+@WINDOWS
+def test_core_only_installs_packages_and_warns_about_processing(launcher_project):
+    root = launcher_project
+    result = run_bat(root, "setup.bat", "--core-only", state={"check-ocr": 31})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SETUP ABGESCHLOSSEN" in result.stdout
+    assert "benoetigt Tesseract OCR" in result.stdout
+    assert "[j/N]" not in result.stdout
+    order = kinds(root)
+    assert order.count("pip") == 1 and "write-requirements-stamp" in order
+    assert "check-ocr" not in order and "gui" not in order
+
+
+@WINDOWS
+def test_pymupdf_runtime_failure_differs_from_missing_package(launcher_project):
+    root = launcher_project
+    # Missing package: one forced reinstall repairs it.
+    result = run_bat(root, "start_app.bat", "--health-only", state={"check-core": 20})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any("--force-reinstall" in c[1] for c in calls(root) if c[0] == "pip")
+
+    # Broken VC++ runtime: pip cannot help, setup.bat is named instead.
+    (root / "calls.jsonl").unlink()
+    result = run_bat(root, "start_app.bat", state={"check-core": 34})
+    assert result.returncode == 34, result.stdout + result.stderr
+    assert "Visual C++" in result.stdout and "setup.bat" in result.stdout
+    assert not any(k in ("pip", "gui") for k in kinds(root))
+
+
+@WINDOWS
+@pytest.mark.parametrize("args,answers,prompted", [("--unattended", "", False), ("", "N\n", True)])
+def test_setup_pymupdf_runtime_failure_reinstalls_once_then_stops(launcher_project, args, answers, prompted):
+    root = launcher_project
+    result = run_bat(root, "setup.bat", args, answers, state={"check-core": 34})
+    assert result.returncode == 34, result.stdout + result.stderr
+    pip_calls = [c for c in calls(root) if c[0] == "pip"]
+    assert len(pip_calls) == 2 and "--force-reinstall" in pip_calls[1][1]
+    assert ("VC++ Redistributable automatisch installieren" in result.stdout) == prompted
+    assert not any(k in ("write-requirements-stamp", "check-ocr") for k in kinds(root))
 
 
 @WINDOWS
@@ -201,12 +361,41 @@ def test_launchers_propagate_gui_exit(launcher_project, launcher):
 
 
 @WINDOWS
+@pytest.mark.parametrize("launcher", ["start_app.bat", "quick_start.bat"])
+def test_launchers_start_gui_without_tesseract_and_without_pip(launcher_project, launcher):
+    root = launcher_project
+    result = run_bat(root, launcher, state={"check-ocr": 31})
+    assert result.returncode == 0, result.stdout + result.stderr
+    order = kinds(root)
+    assert order.count("gui") == 1
+    assert not any(k in ("pip", "ensurepip", "prepare-venv") for k in order)
+    if launcher == "start_app.bat":
+        assert "WARNUNG: Tesseract OCR" in result.stdout
+        assert "Verarbeitung von PDF-Dateien bleibt gesperrt" in result.stdout
+    else:
+        # quick_start stays fast: the GUI itself reports the missing OCR.
+        assert order == ["check-packages", "gui"]
+    assert_local_environment(root)
+
+
+@WINDOWS
 def test_quick_start_missing_environment_never_installs(launcher_project):
     (launcher_project / ".venv").rename(launcher_project / "saved-venv")
     result = run_bat(launcher_project, "quick_start.bat")
     assert result.returncode == 2
     assert "start_app.bat" in result.stdout
     assert calls(launcher_project) == []
+
+
+@WINDOWS
+@pytest.mark.parametrize("code", [20, 34, 35])
+def test_quick_start_missing_package_fails_without_repair(launcher_project, code):
+    root = launcher_project
+    result = run_bat(root, "quick_start.bat", state={"check-packages": code})
+    assert result.returncode == code, result.stdout + result.stderr
+    assert "Python-Paket fehlt oder ist beschaedigt" in result.stdout
+    assert "start_app.bat" in result.stdout
+    assert kinds(root) == ["check-packages"]
 
 
 def test_prepare_venv_preserves_existing_files_on_creation_failure(tmp_path, monkeypatch):

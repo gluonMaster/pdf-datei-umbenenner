@@ -61,6 +61,8 @@ if "%CORE_CODE%"=="10" goto repair_failed_health
 if "%CORE_CODE%"=="20" goto repair_failed_health
 if "%CORE_CODE%"=="21" goto tkinter_failed
 if "%CORE_CODE%"=="22" goto repair_failed_health
+if "%CORE_CODE%"=="34" goto pymupdf_runtime_failed
+if "%CORE_CODE%"=="35" goto repair_failed_health
 if not "%CORE_CODE%"=="0" goto core_data_failed
 
 echo OK: Das vorhandene .venv hat die schnelle Kernpruefung bestanden.
@@ -96,6 +98,13 @@ set "FAIL_CODE=21"
 echo FEHLER: tkinter/Tcl fehlt oder ist beschaedigt. Python mit Tcl/Tk-Unterstuetzung reparieren.
 goto launcher_failure
 
+:pymupdf_runtime_failed
+set "FAIL_CODE=34"
+echo FEHLER: PyMuPDF kann nicht geladen werden: Die Microsoft Visual C++ Laufzeit fehlt
+echo oder ist beschaedigt. Eine Paketinstallation behebt das nicht.
+echo Abhilfe: setup.bat ausfuehren; es bietet die signierte Microsoft-Laufzeit an.
+goto launcher_failure
+
 :repair_environment
 echo Reparatur erforderlich: %REPAIR_REASON%
 call :repair_core
@@ -105,18 +114,24 @@ goto environment_ready
 
 :repair_failure
 set "FAIL_CODE=%ERRORLEVEL%"
+if "%FAIL_CODE%"=="34" goto pymupdf_runtime_failed
 echo FEHLER: Die lokale Umgebung konnte nicht repariert werden.
 goto launcher_failure
 
 :environment_ready
+rem Missing Tesseract never triggers pip: the GUI starts and blocks processing.
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-ocr >>"%LOG_FILE%" 2>&1
-if errorlevel 1 (
-    echo WARNUNG: OCR ist nicht verfuegbar. PDF-Dateien mit Textebene funktionieren.
-    echo Bei Bedarf setup.bat fuer die optionale OCR-Unterstuetzung ausfuehren.
-) else (
-    echo OK: Die optionale OCR-Unterstuetzung ist bereit.
-)
+set "OCR_CODE=%ERRORLEVEL%"
+if "%OCR_CODE%"=="0" goto ocr_ready
+echo WARNUNG: Tesseract OCR mit deutschen Sprachdaten deu ist nicht verfuegbar. Code: %OCR_CODE%.
+echo Die Anwendung startet; Schuelerverzeichnis und Pruefliste sind nutzbar.
+echo Die Verarbeitung von PDF-Dateien bleibt gesperrt. Einrichtung: setup.bat ausfuehren.
+goto launch_application
 
+:ocr_ready
+echo OK: Tesseract OCR mit deutschen Sprachdaten ist bereit.
+
+:launch_application
 if /i "%~1"=="--health-only" (
     echo Reine Zustandspruefung abgeschlossen. Die GUI wurde nicht gestartet.
     exit /b 0
@@ -169,6 +184,7 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
 if "%ERRORLEVEL%"=="20" goto repair_imports_retry
 if "%ERRORLEVEL%"=="22" goto repair_imports_retry
+if "%ERRORLEVEL%"=="35" goto repair_imports_retry
 if errorlevel 1 exit /b %ERRORLEVEL%
 goto repair_write_stamp
 
