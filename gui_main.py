@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
 from pathlib import Path
@@ -18,6 +20,18 @@ from file_renamer import FileRenamer
 from form_parser import FormParser
 from gui_processing import BatchRunner, BatchSettings, WorkerEventKind
 from pdf_extractor import OCR_SETUP_HINT, OCRFallbackExtractor, ocr_unavailable_reason
+from review_preview import PreviewImages, render_preview
+from review_support import (
+    add_subject_to_config,
+    candidate_numbers,
+    field_boxes,
+    format_iso_date,
+    parse_operator_date,
+    preselected_number,
+    rank_students,
+    status_lines,
+)
+from student_registry import format_birth_date
 from processing_service import DocumentProcessingService, PlannedAction
 from review_actions import (
     ReviewActionRequest,
@@ -99,7 +113,9 @@ class PDFRenamerGUI:
         return {"total": 0, "success": 0, "warning": 0, "manual": 0, "error": 0}
 
     def load_subjects_config(self):
-        config_path = Path(__file__).parent / "subjects_config.json"
+        config_path = getattr(
+            self, "subjects_config_path", Path(__file__).parent / "subjects_config.json"
+        )
         try:
             with config_path.open("r", encoding="utf-8") as handle:
                 self.subjects = json.load(handle).get("subjects", [])
@@ -211,20 +227,27 @@ class PDFRenamerGUI:
     def setup_review_tab(self):
         frame = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(frame, text="Prüfung")
-        frame.columnconfigure(0, weight=3)
-        frame.columnconfigure(1, weight=2)
+        frame.columnconfigure(0, weight=1, uniform="review")
+        frame.columnconfigure(1, weight=1, uniform="review")
         frame.rowconfigure(0, weight=1)
 
-        left = ttk.LabelFrame(frame, text="Dateien zur Prüfung", padding="10")
+        left = ttk.Frame(frame)
         left.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
-        scroll_y = ttk.Scrollbar(left, orient=tk.VERTICAL)
-        scroll_x = ttk.Scrollbar(left, orient=tk.HORIZONTAL)
+        left.rowconfigure(1, weight=1)
+
+        files = ttk.LabelFrame(left, text="Dateien zur Prüfung", padding="10")
+        files.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        files.columnconfigure(0, weight=1)
+        files.rowconfigure(0, weight=1)
+        scroll_y = ttk.Scrollbar(files, orient=tk.VERTICAL)
+        scroll_x = ttk.Scrollbar(files, orient=tk.HORIZONTAL)
         self.review_tree = ttk.Treeview(
-            left,
+            files,
             columns=("filename", "name", "subject", "reason"),
             show="headings",
+            height=6,
             yscrollcommand=scroll_y.set,
             xscrollcommand=scroll_x.set,
         )
@@ -241,99 +264,125 @@ class PDFRenamerGUI:
         self.review_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scroll_y.grid(row=0, column=1, sticky=(tk.N, tk.S))
         scroll_x.grid(row=1, column=0, sticky=(tk.W, tk.E))
-        ttk.Button(left, text="Liste aktualisieren", command=self.load_review_queue).grid(
+        ttk.Button(files, text="Liste aktualisieren", command=self.load_review_queue).grid(
             row=2, column=0, columnspan=2, pady=(10, 0), sticky=tk.W
         )
         self.review_tree.bind("<<TreeviewSelect>>", self.on_review_item_selected)
         self.review_tree.bind("<Double-Button-1>", self.on_review_item_double_click)
 
-        right = ttk.LabelFrame(frame, text="Bestätigung", padding="10")
+        scan = ttk.LabelFrame(left, text="Ausschnitte aus dem Scan", padding="10")
+        scan.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(8, 0))
+        scan.columnconfigure(0, weight=1)
+        scan.rowconfigure(0, weight=1)
+        self.preview_images_frame = ttk.Frame(scan)
+        self.preview_images_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        ttk.Button(
+            scan, text="PDF öffnen", command=self.on_review_item_double_click
+        ).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        self._preview_photos = []
+        self._preview_token = None
+        self._preview_executor = None
+
+        right = ttk.LabelFrame(frame, text="Bestätigung", padding="8")
         right.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         right.columnconfigure(0, weight=1)
         right.columnconfigure(1, weight=1)
-        right.rowconfigure(16, weight=1)
 
         self.edit_surname = tk.StringVar()
         self.edit_name = tk.StringVar()
         self.edit_subject = tk.StringVar()
-        self.selected_student = tk.StringVar()
+        self.edit_birth_date = tk.StringVar()
+        self.student_query = tk.StringVar()
         self.save_student_alias = tk.BooleanVar(value=True)
-        self.student_choice_numbers: dict[str, int] = {}
+        self.selected_student_number = None
+        self.student_results = []
+        self._student_search_after = None
+        self._suppress_student_query = False
         self.current_review_item = None
 
         self.file_label = self._detail_row(right, 0, "PDF:")
         self.form_type_label = self._detail_row(right, 1, "Formulartyp:")
         self.raw_name_label = self._detail_row(right, 2, "Erkannter Name:")
-        self.reason_label = self._detail_row(right, 3, "Prüfgrund:", wrap=310)
+        self.status_label = self._detail_row(right, 3, "Status:", wrap=270)
+        self.reason_label = self._detail_row(right, 4, "Prüfgrund:", wrap=270)
 
-        ttk.Label(right, text="Nachname:").grid(row=4, column=0, sticky=tk.W)
-        ttk.Label(right, text="Vorname:").grid(row=4, column=1, sticky=tk.W)
+        ttk.Label(right, text="Nachname:").grid(row=5, column=0, sticky=tk.W)
+        ttk.Label(right, text="Vorname:").grid(row=5, column=1, sticky=tk.W)
         ttk.Entry(right, textvariable=self.edit_surname).grid(
-            row=5, column=0, sticky=(tk.W, tk.E), padx=(0, 4), pady=(0, 6)
+            row=6, column=0, sticky=(tk.W, tk.E), padx=(0, 4), pady=(0, 6)
         )
         ttk.Entry(right, textvariable=self.edit_name).grid(
-            row=5, column=1, sticky=(tk.W, tk.E), padx=(4, 0), pady=(0, 6)
+            row=6, column=1, sticky=(tk.W, tk.E), padx=(4, 0), pady=(0, 6)
         )
-        ttk.Label(right, text="Fach:").grid(row=6, column=0, sticky=tk.W)
-        ttk.Combobox(
+        ttk.Label(right, text="Fach:").grid(row=7, column=0, sticky=tk.W)
+        ttk.Label(right, text="Geburtsdatum (TT.MM.JJJJ):").grid(row=7, column=1, sticky=tk.W)
+        self.subject_combo = ttk.Combobox(
             right, textvariable=self.edit_subject, values=self.subjects, state="normal"
-        ).grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 3))
+        )
+        self.subject_combo.grid(row=8, column=0, sticky=(tk.W, tk.E), padx=(0, 4), pady=(0, 3))
+        ttk.Entry(right, textvariable=self.edit_birth_date).grid(
+            row=8, column=1, sticky=(tk.W, tk.E), padx=(4, 0), pady=(0, 3)
+        )
         self.suggestions_frame = ttk.Frame(right)
         self.suggestions_frame.grid(
-            row=8, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5)
+            row=9, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5)
         )
 
-        ttk.Label(right, text="Ähnliche / bestehende Schüler:").grid(
-            row=9, column=0, columnspan=2, sticky=tk.W
+        ttk.Label(right, text="Schüler suchen (Name oder Nummer):").grid(
+            row=10, column=0, columnspan=2, sticky=tk.W
         )
-        self.student_combo = ttk.Combobox(
-            right, textvariable=self.selected_student, state="readonly"
+        self.student_search_entry = ttk.Entry(right, textvariable=self.student_query)
+        self.student_search_entry.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.E))
+        results = ttk.Frame(right)
+        results.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(2, 0))
+        results.columnconfigure(0, weight=1)
+        self.student_listbox = tk.Listbox(
+            results, height=4, exportselection=False, activestyle="dotbox"
         )
-        self.student_combo.grid(row=10, column=0, columnspan=2, sticky=(tk.W, tk.E))
-        self.student_combo.bind("<<ComboboxSelected>>", self._on_student_choice)
+        listbox_scroll = ttk.Scrollbar(results, command=self.student_listbox.yview)
+        self.student_listbox.config(yscrollcommand=listbox_scroll.set)
+        self.student_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        listbox_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.student_search_hint = ttk.Label(right, text="", foreground="gray")
+        self.student_search_hint.grid(row=13, column=0, columnspan=2, sticky=tk.W)
+        self.student_query.trace_add("write", self._on_student_query_changed)
+        self.student_search_entry.bind("<Return>", self._on_student_search_return)
+        self.student_search_entry.bind("<Down>", self._on_student_search_down)
+        self.student_search_entry.bind("<Escape>", self._on_student_search_escape)
+        self.student_listbox.bind("<<ListboxSelect>>", self._on_student_result_selected)
+        self.student_listbox.bind("<Return>", self._on_student_search_return)
+        self.student_listbox.bind("<Escape>", self._on_student_search_escape)
+
         ttk.Checkbutton(
             right,
             text="Erkannten Namen als Alias speichern",
             variable=self.save_student_alias,
-        ).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(2, 6))
-
-        ttk.Button(
+        ).grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=(2, 6))
+        self.apply_existing_button = ttk.Button(
             right,
-            text="Bestehenden Schüler auswählen und anwenden",
+            text="Ausgewählten Schüler übernehmen",
             command=self.apply_existing_student,
-        ).grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 4))
+            state=tk.DISABLED,
+        )
+        self.apply_existing_button.grid(
+            row=15, column=0, sticky=(tk.W, tk.E), padx=(0, 4), pady=(0, 4)
+        )
         ttk.Button(
             right,
-            text="Als neuen Schüler hinzufügen und anwenden",
+            text="Als neuen Schüler anlegen",
             command=self.apply_correction,
             style="Accent.TButton",
-        ).grid(row=13, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 4))
+        ).grid(row=15, column=1, sticky=(tk.W, tk.E), padx=(4, 0), pady=(0, 4))
         ttk.Button(
             right,
-            text="Nur umbenennen (Schüler nicht speichern)",
+            text="Nur umbenennen",
             command=self.rename_without_student,
-        ).grid(row=14, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 4))
+        ).grid(row=16, column=0, sticky=(tk.W, tk.E), padx=(0, 4))
         ttk.Button(
             right,
-            text="Aus Liste entfernen (ohne Umbenennung)",
+            text="Aus Liste entfernen",
             command=self.remove_from_queue,
-        ).grid(row=15, column=0, columnspan=2, sticky=(tk.W, tk.E))
-
-        preview = ttk.LabelFrame(right, text="Textauszug", padding="5")
-        preview.grid(
-            row=16,
-            column=0,
-            columnspan=2,
-            sticky=(tk.W, tk.E, tk.N, tk.S),
-            pady=(8, 0),
-        )
-        self.preview_text = tk.Text(
-            preview, height=4, width=40, wrap=tk.WORD, state=tk.DISABLED
-        )
-        preview_scroll = ttk.Scrollbar(preview, command=self.preview_text.yview)
-        self.preview_text.config(yscrollcommand=preview_scroll.set)
-        preview_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.preview_text.pack(fill=tk.BOTH, expand=True)
+        ).grid(row=16, column=1, sticky=(tk.W, tk.E), padx=(4, 0))
 
     def setup_students_tab(self):
         frame = ttk.Frame(self.notebook, padding="10")
@@ -369,7 +418,7 @@ class PDFRenamerGUI:
         scroll_y = ttk.Scrollbar(table, orient=tk.VERTICAL)
         self.student_tree = ttk.Treeview(
             table,
-            columns=("number", "last_name", "first_name", "active"),
+            columns=("number", "last_name", "first_name", "birth_date", "active"),
             show="headings",
             yscrollcommand=scroll_y.set,
             selectmode="browse",
@@ -378,8 +427,9 @@ class PDFRenamerGUI:
         for key, title, width, anchor in (
             ("number", "Nummer", 90, tk.E),
             ("last_name", "Nachname", 260, tk.W),
-            ("first_name", "Vorname", 260, tk.W),
-            ("active", "Status", 120, tk.CENTER),
+            ("first_name", "Vorname", 240, tk.W),
+            ("birth_date", "Geburtsdatum", 120, tk.CENTER),
+            ("active", "Status", 110, tk.CENTER),
         ):
             self.student_tree.heading(key, text=title)
             self.student_tree.column(key, width=width, minwidth=70, anchor=anchor)
@@ -513,6 +563,7 @@ class PDFRenamerGUI:
                     student.number,
                     student.last_name,
                     student.first_name,
+                    format_birth_date(getattr(student, "birth_date", None)),
                     "Aktiv" if student.active else "Inaktiv",
                 ),
             )
@@ -540,6 +591,9 @@ class PDFRenamerGUI:
         dialog.grab_set()
         last_name = tk.StringVar(value=student.last_name if student else "")
         first_name = tk.StringVar(value=student.first_name if student else "")
+        birth_date = tk.StringVar(
+            value=format_birth_date(getattr(student, "birth_date", None)) if student else ""
+        )
         active = tk.BooleanVar(value=student.active if student else True)
         result = []
         body = ttk.Frame(dialog, padding="12")
@@ -552,8 +606,15 @@ class PDFRenamerGUI:
         ttk.Entry(body, textvariable=first_name).grid(
             row=1, column=1, sticky=(tk.W, tk.E), padx=(8, 0), pady=4
         )
+        ttk.Label(body, text="Geburtsdatum:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(body, textvariable=birth_date).grid(
+            row=2, column=1, sticky=(tk.W, tk.E), padx=(8, 0), pady=4
+        )
+        ttk.Label(body, text="TT.MM.JJJJ, leer = unbekannt", foreground="gray").grid(
+            row=3, column=1, sticky=tk.W, padx=(8, 0)
+        )
         ttk.Checkbutton(body, text="Aktiv", variable=active).grid(
-            row=2, column=0, columnspan=2, sticky=tk.W, pady=(4, 10)
+            row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 10)
         )
 
         def accept():
@@ -562,11 +623,16 @@ class PDFRenamerGUI:
                     title, "Nachname und Vorname sind erforderlich.", parent=dialog
                 )
                 return
-            result.append((last_name.get(), first_name.get(), active.get()))
+            try:
+                parsed_date = parse_operator_date(birth_date.get())
+            except ValueError as error:
+                messagebox.showwarning(title, str(error), parent=dialog)
+                return
+            result.append((last_name.get(), first_name.get(), active.get(), parsed_date))
             dialog.destroy()
 
         actions = ttk.Frame(body)
-        actions.grid(row=3, column=0, columnspan=2, sticky=tk.E)
+        actions.grid(row=5, column=0, columnspan=2, sticky=tk.E)
         ttk.Button(actions, text="Abbrechen", command=dialog.destroy).pack(
             side=tk.RIGHT, padx=(6, 0)
         )
@@ -587,7 +653,10 @@ class PDFRenamerGUI:
             return
         try:
             student = self.student_registry.add_student(
-                values[0], values[1], active=values[2]
+                values[0],
+                values[1],
+                active=values[2],
+                birth_date=values[3] if len(values) > 3 else None,
             )
         except Exception as error:
             messagebox.showerror("Schüler konnte nicht gespeichert werden", str(error))
@@ -606,13 +675,11 @@ class PDFRenamerGUI:
             return
         if not self._ensure_idle():
             return
+        changes = {"last_name": values[0], "first_name": values[1], "active": values[2]}
+        if len(values) > 3:
+            changes["birth_date"] = values[3]
         try:
-            self.student_registry.update_student(
-                number,
-                last_name=values[0],
-                first_name=values[1],
-                active=values[2],
-            )
+            self.student_registry.update_student(number, **changes)
         except Exception as error:
             messagebox.showerror("Schüler konnte nicht gespeichert werden", str(error))
             return
@@ -954,66 +1021,231 @@ class PDFRenamerGUI:
             return
         if self.current_review_item and self.current_review_item.file_path == file_path:
             return
+        # Nothing from the previous document (selection, query, images) may
+        # carry over to this one.
+        self.clear_edit_fields()
         self.current_review_item = review_item
-        self.file_label.config(text=str(self.review_store.store_path.parent / file_path))
+        self.file_label.config(text=file_path)
         self.form_type_label.config(text=review_item.form_type or "Unbekannt")
         self.raw_name_label.config(text=review_item.raw_name or "—")
+        self.status_label.config(text="\n".join(status_lines(review_item)))
         self.reason_label.config(text=review_item.reason or "—")
 
-        parts = (review_item.canonical_name or review_item.raw_name or "").split(maxsplit=1)
-        self.edit_surname.set(parts[0] if parts else "")
-        self.edit_name.set(parts[1] if len(parts) > 1 else "")
+        proposal = review_item.new_student_proposal or {}
+        if proposal and not review_item.canonical_name:
+            self.edit_surname.set(proposal.get("last_name") or "")
+            self.edit_name.set(proposal.get("first_name") or "")
+        else:
+            parts = (review_item.canonical_name or review_item.raw_name or "").split(maxsplit=1)
+            self.edit_surname.set(parts[0] if parts else "")
+            self.edit_name.set(parts[1] if len(parts) > 1 else "")
+        self.edit_birth_date.set(
+            format_iso_date(review_item.birth_date or proposal.get("birth_date"))
+        )
         self.edit_subject.set(review_item.canonical_subject or review_item.raw_subject or "")
         self.save_student_alias.set(bool(review_item.raw_name))
         self.update_suggestion_buttons(review_item.suggestions)
         self._update_student_choices(review_item)
+        self._request_preview(review_item)
 
-        self.preview_text.config(state=tk.NORMAL)
-        self.preview_text.delete(1.0, tk.END)
-        self.preview_text.insert(1.0, review_item.preview_text or "")
-        self.preview_text.config(state=tk.DISABLED)
+    def _update_student_choices(self, item, select=None):
+        """Show search results for ``item`` and preselect a clear leader.
 
-    def _update_student_choices(self, item):
-        suggestions = set(item.student_suggestions or [])
-        ordered = sorted(
-            getattr(self.student_registry, "students", ()),
-            key=lambda student: (
-                student.full_name not in suggestions,
-                student.last_name.casefold(),
-                student.first_name.casefold(),
-                student.number,
-            ),
-        )
-        self.student_choice_numbers = {
-            f"Nr. {student.number} — {student.full_name}": student.number
-            for student in ordered
-        }
-        choices = list(self.student_choice_numbers)
-        self.student_combo.config(values=choices)
-        selected = next(
-            (
-                display
-                for display, number in self.student_choice_numbers.items()
-                if number == item.canonical_student_number
-            ),
-            "",
-        )
-        self.selected_student.set(selected)
-        if selected:
-            # The registry owns field boundaries, including compound surnames.
-            self._on_student_choice()
+        The selection is bound to the stable student number, never to a row
+        position or the typed text.
+        """
 
-    def _on_student_choice(self, _event=None):
-        number = self.student_choice_numbers.get(self.selected_student.get())
+        self._cancel_student_search()
+        self._render_student_results(item)
+        number = select
         if number is None:
+            number = getattr(self, "selected_student_number", None)
+        if number is None:
+            number = preselected_number(item)
+        if number is not None:
+            self._select_student(number)
+
+    def _render_student_results(self, item=None):
+        item = item or self.current_review_item
+        if item is None:
             return
+        students = getattr(self.student_registry, "students", ())
+        query = self.student_query.get()
+        self.student_results = rank_students(students, query, candidate_numbers(item))
+        self.student_listbox.delete(0, tk.END)
+        for choice in self.student_results:
+            self.student_listbox.insert(tk.END, choice.label)
+        if not self.student_results and query.strip():
+            hint = "Keine Treffer – ggf. als neuen Schüler anlegen."
+        elif any(choice.kind == "similar" for choice in self.student_results):
+            hint = "Keine genauen Treffer; ≈ markiert ähnliche Namen."
+        else:
+            hint = "★ = vorgeschlagen; Enter wählt aus, die Schaltfläche übernimmt."
+        self.student_search_hint.config(text=hint)
+        self._highlight_selected_student()
+
+    def _on_student_query_changed(self, *_args):
+        if getattr(self, "_suppress_student_query", False):
+            return
+        # A previous choice must never silently apply to new search text.
+        self.selected_student_number = None
+        self._update_apply_state()
+        self._cancel_student_search()
+        self._student_search_after = self.root.after(200, self._run_student_search)
+
+    def _run_student_search(self):
+        self._student_search_after = None
+        self._render_student_results()
+
+    def _cancel_student_search(self):
+        pending = getattr(self, "_student_search_after", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                pass
+        self._student_search_after = None
+
+    def _on_student_result_selected(self, _event=None):
+        selection = self.student_listbox.curselection()
+        if not selection or selection[0] >= len(self.student_results):
+            return
+        self._select_student(self.student_results[selection[0]].number)
+
+    def _on_student_search_return(self, _event=None):
+        """Enter selects the highlighted (or first) result; it never applies."""
+
+        self._cancel_student_search()
+        if self.student_query.get().strip():
+            self._render_student_results()
+        if not self.student_results:
+            return "break"
+        selection = self.student_listbox.curselection()
+        index = selection[0] if selection else 0
+        if index < len(self.student_results):
+            self._select_student(self.student_results[index].number)
+        return "break"
+
+    def _on_student_search_down(self, _event=None):
+        self._cancel_student_search()
+        self._render_student_results()
+        if not self.student_results:
+            return "break"
+        self.student_listbox.focus_set()
+        self.student_listbox.selection_clear(0, tk.END)
+        self.student_listbox.selection_set(0)
+        self.student_listbox.activate(0)
+        self._on_student_result_selected()
+        return "break"
+
+    def _on_student_search_escape(self, _event=None):
+        self.student_query.set("")
+        self.student_search_entry.focus_set()
+        return "break"
+
+    def _select_student(self, number):
         try:
             student = self.student_registry.select_existing(number)
         except Exception as error:
             self.log_message(f"❌ Schüler konnte nicht ausgewählt werden: {error}")
             return
+        self.selected_student_number = student.number
+        # The registry owns field boundaries, including compound surnames.
         self.edit_surname.set(student.last_name)
         self.edit_name.set(student.first_name)
+        self._highlight_selected_student()
+        self._update_apply_state()
+
+    def _highlight_selected_student(self):
+        listbox = getattr(self, "student_listbox", None)
+        if listbox is None:
+            return
+        listbox.selection_clear(0, tk.END)
+        for index, choice in enumerate(self.student_results):
+            if choice.number == self.selected_student_number:
+                listbox.selection_set(index)
+                listbox.activate(index)
+                listbox.see(index)
+                break
+
+    def _update_apply_state(self):
+        button = getattr(self, "apply_existing_button", None)
+        if button is not None:
+            enabled = getattr(self, "selected_student_number", None) is not None
+            button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _request_preview(self, item):
+        """Render scan fragments in the background for the selected entry."""
+
+        token = object()
+        self._preview_token = token
+        self._show_preview_message("Ausschnitte werden geladen …")
+        if self._preview_executor is None:
+            self._preview_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="scan-preview"
+            )
+        path = self.review_store.store_path.parent / item.file_path
+        try:
+            future = self._preview_executor.submit(
+                render_preview, path, field_boxes(item), item.page_rotation
+            )
+        except RuntimeError:
+            return
+        self._preview_future = future
+        self.root.after(80, lambda: self._poll_preview(future, token))
+
+    def _wait_for_preview(self, timeout=10.0):
+        """Let a running render finish before the PDF is moved or renamed."""
+
+        future = getattr(self, "_preview_future", None)
+        if future is not None:
+            try:
+                future.result(timeout=timeout)
+            except Exception:
+                pass
+
+    def _poll_preview(self, future, token):
+        if token is not self._preview_token:
+            return  # Another document was selected meanwhile.
+        if not future.done():
+            self.root.after(80, lambda: self._poll_preview(future, token))
+            return
+        try:
+            images = future.result()
+        except Exception as error:
+            images = PreviewImages(error=f"Vorschau nicht verfügbar: {error}")
+        self._show_preview(images)
+
+    def _clear_preview(self):
+        frame = getattr(self, "preview_images_frame", None)
+        if frame is not None:
+            for widget in frame.winfo_children():
+                widget.destroy()
+        self._preview_photos = []
+
+    def _show_preview_message(self, text):
+        self._clear_preview()
+        ttk.Label(self.preview_images_frame, text=text, wraplength=520).grid(
+            row=0, column=0, sticky=tk.W
+        )
+
+    def _show_preview(self, images):
+        self._clear_preview()
+        frame = self.preview_images_frame
+        row = 0
+        entries = list(images.fragments)
+        if images.page:
+            entries.append(("Seite (keine Feldpositionen gespeichert)", images.page))
+        for caption, png in entries:
+            ttk.Label(frame, text=f"{caption}:").grid(row=row, column=0, sticky=tk.W)
+            photo = tk.PhotoImage(master=self.root, data=base64.b64encode(png).decode("ascii"))
+            self._preview_photos.append(photo)
+            ttk.Label(frame, image=photo).grid(row=row + 1, column=0, sticky=tk.W, pady=(0, 6))
+            row += 2
+        if images.error:
+            ttk.Label(frame, text=images.error, wraplength=520).grid(
+                row=row, column=0, sticky=tk.W
+            )
 
     def on_review_item_double_click(self, _event=None):
         selection = self.review_tree.selection()
@@ -1035,11 +1267,51 @@ class PDFRenamerGUI:
                 text=suggestion,
                 command=lambda value=suggestion: self.edit_subject.set(value),
             ).grid(row=index // 2, column=index % 2, padx=2, pady=2, sticky=tk.W)
+        proposal = getattr(self.current_review_item, "subject_proposal", None)
+        if proposal and proposal not in (self.subjects or []):
+            ttk.Button(
+                self.suggestions_frame,
+                text=f"Neues Fach übernehmen: {proposal}",
+                command=self.adopt_subject_proposal,
+            ).grid(row=3, column=0, columnspan=2, padx=2, pady=2, sticky=tk.W)
+
+    def adopt_subject_proposal(self):
+        """Add the proposed subject to the subject list in one confirmed step."""
+
+        if not self._ensure_idle():
+            return
+        item = self.current_review_item
+        proposal = getattr(item, "subject_proposal", None) if item else None
+        if not proposal:
+            return
+        if not messagebox.askyesno(
+            "Neues Fach",
+            f"„{proposal}“ als neues Fach in die Fächerliste aufnehmen?",
+        ):
+            return
+        config_path = getattr(
+            self, "subjects_config_path", Path(__file__).parent / "subjects_config.json"
+        )
+        try:
+            added = add_subject_to_config(config_path, proposal)
+        except Exception as error:
+            messagebox.showerror("Fach konnte nicht gespeichert werden", str(error))
+            return
+        # Parser and validator read the list again without a restart.
+        TextParser._subjects_cache = None
+        Validator._subjects_cache = None
+        self.load_subjects_config()
+        self.subject_combo.config(values=self.subjects)
+        self.edit_subject.set(proposal)
+        self.update_suggestion_buttons(item.suggestions)
+        self.log_message(
+            f"📚 Fach „{proposal}“ " + ("wurde aufgenommen." if added else "ist bereits vorhanden.")
+        )
 
     def apply_existing_student(self):
-        number = self.student_choice_numbers.get(self.selected_student.get())
+        number = getattr(self, "selected_student_number", None)
         if number is None:
-            messagebox.showwarning("Warnung", "Bitte wählen Sie einen Schüler aus.")
+            messagebox.showwarning("Warnung", "Bitte wählen Sie einen Schüler aus der Liste aus.")
             return
         self._apply_review_action(ReviewDecision.USE_EXISTING, number)
 
@@ -1075,6 +1347,12 @@ class PDFRenamerGUI:
                 f"Das Fach '{subject}' ist nicht konfiguriert. Trotzdem verwenden?",
             ):
                 return
+        birth_date_field = getattr(self, "edit_birth_date", None)
+        try:
+            birth_date = parse_operator_date(birth_date_field.get() if birth_date_field else "")
+        except ValueError as error:
+            messagebox.showerror("Ungültiges Geburtsdatum", str(error))
+            return
         try:
             fallback_month = (
                 int(self.selected_month.get())
@@ -1087,6 +1365,7 @@ class PDFRenamerGUI:
         except (tk.TclError, TypeError, ValueError):
             messagebox.showerror("Fehler", "Monat und Jahr sind ungültig.")
             return
+        self._wait_for_preview()
         request = ReviewActionRequest(
             item=self.current_review_item,
             base_folder=Path(folder),
@@ -1098,11 +1377,12 @@ class PDFRenamerGUI:
             save_student_alias=self.save_student_alias.get(),
             fallback_month=fallback_month,
             fallback_year=fallback_year,
+            birth_date=birth_date,
         )
         result = self.review_actions.apply(request)
         icon = "✅" if result.succeeded else "⚠️" if result.status == ReviewActionStatus.PARTIAL else "❌"
         self.log_message(f"{icon} {result.message}")
-        if result.registry_saved or result.student_alias_saved:
+        if result.registry_saved or result.student_alias_saved or result.birth_date_saved:
             self._after_student_change(
                 result.student.number if result.student is not None else None
             )
@@ -1157,20 +1437,29 @@ class PDFRenamerGUI:
             self.file_label,
             self.form_type_label,
             self.raw_name_label,
+            self.status_label,
             self.reason_label,
         ):
             label.config(text="—")
         self.edit_surname.set("")
         self.edit_name.set("")
         self.edit_subject.set("")
-        self.selected_student.set("")
-        self.student_combo.config(values=[])
-        self.student_choice_numbers = {}
-        self.preview_text.config(state=tk.NORMAL)
-        self.preview_text.delete(1.0, tk.END)
-        self.preview_text.config(state=tk.DISABLED)
+        self.edit_birth_date.set("")
+        self._cancel_student_search()
+        self._suppress_student_query = True
+        try:
+            self.student_query.set("")
+        finally:
+            self._suppress_student_query = False
+        self.selected_student_number = None
+        self.student_results = []
+        self.student_listbox.delete(0, tk.END)
+        self.student_search_hint.config(text="")
+        self._update_apply_state()
         for widget in self.suggestions_frame.winfo_children():
             widget.destroy()
+        self._preview_token = None
+        self._clear_preview()
 
     def validate_input(self):
         folder = self.selected_folder.get().strip()
@@ -1296,6 +1585,9 @@ class PDFRenamerGUI:
         if self.processing:
             self.root.after(50, self._finish_close)
             return
+        executor = getattr(self, "_preview_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
     def _drain_worker_events(self):

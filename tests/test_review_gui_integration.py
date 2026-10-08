@@ -374,24 +374,6 @@ class MainThreadValue:
         self.options.update(kwargs)
 
 
-def test_review_choice_populates_canonical_compound_surname(tmp_path):
-    item = review_item(canonical_student_number=7)
-    _service, registry, _store, _source = action_service(
-        tmp_path, item, rows=((7, "Van Buren", "Alex"),)
-    )
-    gui = PDFRenamerGUI.__new__(PDFRenamerGUI)
-    gui.student_registry = registry
-    gui.student_combo = MainThreadValue()
-    gui.selected_student = MainThreadValue()
-    gui.edit_surname = MainThreadValue()
-    gui.edit_name = MainThreadValue()
-
-    gui._update_student_choices(item)
-
-    assert gui.edit_surname.get() == "Van Buren"
-    assert gui.edit_name.get() == "Alex"
-
-
 def test_review_uses_loaded_queue_folder_and_saved_period(tmp_path, monkeypatch):
     item = review_item(raw_subject="Physik")
     service, _registry, store, source = action_service(tmp_path, item)

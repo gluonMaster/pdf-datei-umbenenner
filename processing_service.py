@@ -688,6 +688,7 @@ class DocumentProcessingService:
                 if hasattr(item, "student") and hasattr(item, "score")
             ],
             new_student_proposal=self._proposal_dict(student_match),
+            page_rotation=int(getattr(extraction, "rotation", 0) or 0),
         )
 
         return ProcessingResult(

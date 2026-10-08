@@ -53,6 +53,8 @@ class ReviewItem:
     # student, the recognized values ({last_name, first_name, birth_date}).
     student_candidates: List[dict] = field(default_factory=list)
     new_student_proposal: Optional[dict] = None
+    # Clockwise rotation applied before recognition; field boxes refer to it.
+    page_rotation: int = 0
     
     def to_dict(self) -> dict:
         """Преобразует ReviewItem в словарь"""
@@ -116,6 +118,12 @@ class ReviewItem:
             self.new_student_proposal, dict
         ):
             raise TypeError("'new_student_proposal' muss ein JSON-Objekt oder null sein")
+        if (
+            not isinstance(self.page_rotation, int)
+            or isinstance(self.page_rotation, bool)
+            or self.page_rotation % 90
+        ):
+            raise TypeError("'page_rotation' muss ein Vielfaches von 90 sein")
 
         for field_name in ("suggestions", "parser_reasons", "student_suggestions"):
             value = getattr(self, field_name)

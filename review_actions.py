@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from file_renamer import FileRenamer
 from review_queue import ReviewItem, ReviewStore
+from review_support import is_value_list
 from student_registry import Student, normalize_name
 
 
@@ -39,6 +40,9 @@ class ReviewActionRequest:
     save_student_alias: bool = True
     fallback_month: Optional[int] = None
     fallback_year: Optional[int] = None
+    # Birth date confirmed or corrected by the operator; overrides the
+    # recognized date of the queue entry.
+    birth_date: Optional[date] = None
 
 
 @dataclass(frozen=True)
@@ -136,10 +140,14 @@ class ReviewActionService:
             elif decision != ReviewDecision.RENAME_ONLY:
                 raise ValueError(f"Unbekannte Prüfaktion: {decision}")
 
-            birth_date_saved = self._learn_birth_date(student, request.item)
+            birth_date_saved = self._learn_birth_date(
+                student, request.item, request.birth_date
+            )
 
             raw_subject = (request.item.raw_subject or "").strip()
-            if raw_subject and raw_subject != subject:
+            # A list of conflicting values ("Deutsch, Englisch") never becomes
+            # one alias of the chosen subject.
+            if raw_subject and raw_subject != subject and not is_value_list(raw_subject):
                 add_and_save = getattr(self.subject_aliases, "add_and_save", None)
                 if callable(add_and_save):
                     alias_saved = bool(add_and_save(raw_subject, subject))
@@ -273,15 +281,21 @@ class ReviewActionService:
                 False,
             )
 
-    def _learn_birth_date(self, student: Optional[Student], item: ReviewItem) -> bool:
-        """Store the document's birth date for an operator-confirmed student.
+    def _learn_birth_date(
+        self,
+        student: Optional[Student],
+        item: ReviewItem,
+        confirmed: Optional[date] = None,
+    ) -> bool:
+        """Store the birth date for an operator-confirmed student.
 
-        Only a cleanly read date (no contradicting readings) is used, and an
-        already stored date is never replaced. Failures do not stop the action.
+        A date entered or confirmed by the operator wins; otherwise only a
+        cleanly read date (no contradicting readings) is used. An already
+        stored date is never replaced. Failures do not stop the action.
         """
 
         learn = getattr(self.student_registry, "learn_birth_date", None)
-        birth_date = self._item_birth_date(item)
+        birth_date = confirmed or self._item_birth_date(item)
         if student is None or birth_date is None or not callable(learn):
             return False
         try:
