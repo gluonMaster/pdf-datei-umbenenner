@@ -11,7 +11,12 @@ from alias_manager import AliasManager
 from file_renamer import FileRenamer
 from form_parser import FormParser
 from ocr import TesseractOCRProvider
-from pdf_extractor import OCRFallbackExtractor, PDFExtractor
+from pdf_extractor import (
+    OCR_SETUP_HINT,
+    OCRFallbackExtractor,
+    PDFExtractor,
+    ocr_unavailable_reason,
+)
 from processing_service import (
     BatchProcessingResult,
     DocumentProcessingService,
@@ -23,6 +28,8 @@ from student_registry import StudentRegistry
 from student_registry_service import StudentRegistryPaths
 from text_parser import TextParser
 from validator import Validator
+
+EXIT_OCR_UNAVAILABLE = 3
 
 
 def build_processing_service(
@@ -306,6 +313,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         year=args.year,
         tesseract_path=args.tesseract_path,
     )
+    ocr_problem = ocr_unavailable_reason(app.service.extractor)
+    if ocr_problem:
+        print(f"Fehler: {ocr_problem}")
+        print(OCR_SETUP_HINT)
+        return EXIT_OCR_UNAVAILABLE
     batch = app.run()
     return 2 if batch.errors or batch.review_queue_error else 0
 

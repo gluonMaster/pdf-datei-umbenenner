@@ -1,5 +1,6 @@
-"""Optional OCR fallback tests; the normal suite needs no Tesseract install."""
+"""OCR reading tests; only the real-engine tests need a Tesseract install."""
 
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 
@@ -16,7 +17,7 @@ from ocr import (
     TesseractOCRProvider,
     ocr_words_to_page_data,
 )
-from page_data import ExtractionSource, PageData
+from page_data import ExtractionSource, PageData, PageImage
 from pdf_extractor import OCRFallbackExtractor, PDFExtractor
 from processing_service import DocumentProcessingService, PlannedAction
 from review_queue import ReviewStore
@@ -134,7 +135,9 @@ def test_fake_ocr_success_reuses_existing_parser_pipeline(tmp_path):
     assert result.ocr_status == OCRStatus.SUCCESS.value
 
 
-def test_text_layer_does_not_call_ocr(tmp_path):
+def test_text_layer_is_kept_as_second_reading(tmp_path):
+    # Replaces the former "text layer skips OCR" rule: scanner text layers
+    # are often badly recognized, so OCR reads every page (decision 2026-10-08).
     page = PageData(
         595,
         842,
@@ -145,8 +148,251 @@ def test_text_layer_does_not_call_ocr(tmp_path):
 
     extracted = extractor.extract_page_data(tmp_path / "text.pdf")
 
-    assert extracted is page
-    assert provider.calls == 0
+    assert provider.calls == 1
+    assert extracted.source == ExtractionSource.OCR
+    assert extracted.ocr_status == OCRStatus.SUCCESS.value
+    assert extracted.alternatives == (page,)
+
+
+def test_ocr_failure_keeps_the_text_layer_for_review(tmp_path):
+    page = PageData(595, 842, "Sample Student Mathematik\nBewilligungszeitraum")
+    provider = FakeOCRProvider(OCRResult.failed("OCR fehlgeschlagen: Zeitlimit"))
+    extractor = OCRFallbackExtractor(StaticTextExtractor(page), provider)
+
+    extracted = extractor.extract_page_data(tmp_path / "text.pdf")
+
+    assert extracted.source == ExtractionSource.PDF_TEXT
+    assert extracted.text == page.text
+    assert extracted.ocr_status == OCRStatus.FAILED.value
+    assert extracted.diagnostics[0] == "OCR fehlgeschlagen: Zeitlimit"
+
+
+def _tsv(*words):
+    header = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+        "left\ttop\twidth\theight\tconf\ttext"
+    )
+    rows = [
+        f"5\t1\t1\t1\t1\t{index}\t{index * 40}\t10\t30\t12\t91.5\t{word}"
+        for index, word in enumerate(words, 1)
+    ]
+    return "\n".join([header, *rows])
+
+
+def test_tsv_words_after_quotation_marks_are_not_swallowed():
+    words = ['"Mit', "meiner", "„Anwesenheitsnachweis“", 'Schüler"', "Ende"]
+
+    parsed = TesseractOCRProvider._parse_tsv(_tsv(*words))
+
+    assert [word.text for word in parsed] == words
+    assert parsed[-1].left == 200
+    assert parsed[0].confidence == pytest.approx(0.915)
+
+
+def test_parser_uses_text_layer_when_ocr_reading_has_no_structure():
+    text_layer = PageData(
+        595,
+        842,
+        "Sample Student Mathematik\nBewilligungszeitraum von 01.01.2026\n"
+        "Monat Januar\nUnterrichtsart\nLehrer(in)",
+    )
+    ocr_reading = PageData(
+        595,
+        842,
+        "unlesbar",
+        source=ExtractionSource.OCR,
+        alternatives=(text_layer,),
+    )
+
+    result = FormParser().parse(ocr_reading)
+
+    assert result.form_type == FormType.LEGACY
+    assert result.student_name == "Sample Student"
+    assert any("Textebene" in reason for reason in result.reasons)
+
+
+def _unstructured_ocr_page():
+    return ocr_words_to_page_data(
+        [OCRWord("unlesbar", 40, 40, 80, 20, 0.5)],
+        image_width=600,
+        image_height=800,
+        page_width=600,
+        page_height=800,
+    )
+
+
+class RotatingProvider:
+    """Structure appears only after the configured rotation."""
+
+    def __init__(self, upright_after=180, osd=None, image=None):
+        self.upright_after = upright_after
+        self.osd = osd
+        self.image = image
+        self.rotations = []
+
+    def check_availability(self):
+        return OCRAvailability(True, "fake provider")
+
+    def recognize_first_page(self, _path, rotation=0, **_dimensions):
+        self.rotations.append(rotation)
+        page = (
+            _legacy_ocr_page()
+            if rotation == self.upright_after
+            else _unstructured_ocr_page()
+        )
+        return OCRResult.success(replace(page, rotation=rotation, image=self.image))
+
+    def detect_rotation(self, _image):
+        return self.osd
+
+
+def test_upside_down_page_is_recognized_once_more(tmp_path):
+    provider = RotatingProvider(upright_after=180)
+    extractor = OCRFallbackExtractor(StaticTextExtractor(PageData(600, 800, "")), provider)
+
+    page = extractor.extract_page_data(tmp_path / "upside-down.pdf")
+
+    assert provider.rotations == [0, 180]
+    assert page.rotation == 180
+    assert "180°" in page.diagnostics[-1]
+
+
+def test_orientation_reported_by_osd_is_used(tmp_path):
+    image = PageImage(b"png", 600, 800, 300)
+    provider = RotatingProvider(upright_after=90, osd=90, image=image)
+    extractor = OCRFallbackExtractor(StaticTextExtractor(PageData(600, 800, "")), provider)
+
+    page = extractor.extract_page_data(tmp_path / "sideways.pdf")
+
+    assert provider.rotations == [0, 90]
+    assert page.rotation == 90
+
+
+@pytest.mark.parametrize("upright_after,expected_calls", [(0, [0]), (None, [0, 180])])
+def test_orientation_retry_is_bounded(tmp_path, upright_after, expected_calls):
+    provider = RotatingProvider(upright_after=upright_after)
+    extractor = OCRFallbackExtractor(StaticTextExtractor(PageData(600, 800, "")), provider)
+
+    page = extractor.extract_page_data(tmp_path / "scan.pdf")
+
+    assert provider.rotations == expected_calls
+    assert page.rotation == 0
+
+
+def test_rendered_image_is_released_after_parsing(tmp_path):
+    source = tmp_path / "image-only.pdf"
+    _image_only_pdf(source)
+    page = replace(_legacy_ocr_page(), image=PageImage(b"png", 600, 800, 300))
+    provider = FakeOCRProvider(OCRResult.success(page))
+    extractor = OCRFallbackExtractor(PDFExtractor(), provider)
+
+    result = _service(tmp_path, extractor).process_document(
+        source, month=1, year=2035, dry_run=True
+    )
+
+    assert result.planned_action == PlannedAction.RENAME
+    assert result.extraction.image is None
+
+
+class NoOCRExtractor:
+    def check_ocr_availability(self):
+        return OCRAvailability(False, "OCR ist nicht verfügbar: Test-Tesseract fehlt.")
+
+    def extract_page_data(self, _path):
+        raise AssertionError("Without OCR no document may be processed.")
+
+
+def test_cli_refuses_processing_without_ocr(monkeypatch, tmp_path, capsys):
+    import main as main_module
+
+    folder = tmp_path / "scans"
+    folder.mkdir()
+    (folder / "scan.pdf").write_bytes(b"%PDF synthetic")
+    monkeypatch.setattr(main_module, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.setattr(main_module, "OCRFallbackExtractor", lambda *_a: NoOCRExtractor())
+
+    code = main_module.main([str(folder), "--month", "1", "--year", "2030", "--dry-run"])
+
+    output = capsys.readouterr().out
+    assert code == main_module.EXIT_OCR_UNAVAILABLE
+    assert "Test-Tesseract fehlt" in output and "setup.bat" in output
+    assert sorted(item.name for item in folder.iterdir()) == ["scan.pdf"]
+
+
+def test_gui_refuses_batch_without_ocr(monkeypatch):
+    import gui_main
+
+    gui = gui_main.PDFRenamerGUI.__new__(gui_main.PDFRenamerGUI)
+    gui._student_task_running = False
+    gui.processing = False
+    gui.validate_input = lambda: True
+    gui.extractor = NoOCRExtractor()
+    logs, errors = [], []
+    gui.log_message = logs.append
+    monkeypatch.setattr(
+        gui_main.messagebox,
+        "showerror",
+        lambda title, message: errors.append((title, message)),
+    )
+    monkeypatch.setattr(
+        gui_main.threading,
+        "Thread",
+        lambda *_a, **_k: pytest.fail("Without OCR no batch may start."),
+    )
+
+    gui_main.PDFRenamerGUI.start_processing(gui)
+
+    assert gui.processing is False
+    assert errors and "setup.bat" in errors[0][1]
+    assert logs and "Test-Tesseract fehlt" in logs[0]
+
+
+def _provider_with_fake_executable(tmp_path):
+    executable = tmp_path / "tesseract.exe"
+    executable.write_bytes(b"fake")
+    return TesseractOCRProvider(executable), executable
+
+
+def test_successful_availability_is_reused_but_failure_is_not(monkeypatch, tmp_path):
+    provider, executable = _provider_with_fake_executable(tmp_path)
+    answers = [
+        OCRAvailability(False, "fehlt"),
+        OCRAvailability(True, "ok", executable, ("deu", "eng")),
+    ]
+    calls = []
+
+    def query():
+        calls.append(1)
+        return answers[len(calls) - 1]
+
+    monkeypatch.setattr(provider, "_query_availability", query)
+
+    assert not provider.check_availability().available
+    assert provider.check_availability().available
+    assert provider.check_availability().available
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stdout,languages,expected", [
+    (b"Orientation in degrees: 180\nRotate: 180\nOrientation confidence: 7.5\n",
+     ("deu", "eng", "osd"), 180),
+    (b"Rotate: 270\nOrientation confidence: 1.3\n", ("deu", "eng", "osd"), 90),
+    (b"Rotate: 90\nOrientation confidence: 0.4\n", ("deu", "eng", "osd"), None),
+    (b"Rotate: 180\nOrientation confidence: 7.5\n", ("deu", "eng"), None),
+    (b"Too few characters. Skipping this page\n", ("deu", "eng", "osd"), None),
+])
+def test_osd_rotation_is_used_only_when_reliable(
+    monkeypatch, tmp_path, stdout, languages, expected
+):
+    provider, executable = _provider_with_fake_executable(tmp_path)
+    provider._available = OCRAvailability(True, "ok", executable, languages)
+    monkeypatch.setattr(
+        provider,
+        "_run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout=stdout, stderr=b""),
+    )
+
+    assert provider.detect_rotation(PageImage(b"png", 10, 10, 300)) == expected
 
 
 def test_unavailable_ocr_is_diagnostic_manual_review(tmp_path):
@@ -261,12 +507,7 @@ def test_tesseract_reports_missing_language_data(monkeypatch, tmp_path):
     assert "Tesseract-Sprachdaten fehlen: deu" in availability.message
 
 
-def test_real_tesseract_image_only_pdf_when_available(tmp_path):
-    provider = TesseractOCRProvider()
-    availability = provider.check_availability()
-    if not availability.available:
-        pytest.skip(availability.message)
-
+def _synthetic_legacy_image(extra_lines=()):
     image = Image.new("RGB", (2480, 3508), "white")
     draw = ImageDraw.Draw(image)
     try:
@@ -279,9 +520,43 @@ def test_real_tesseract_image_only_pdf_when_available(tmp_path):
         "Monat Januar",
         "Unterrichtsart",
         "Lehrer(in)",
+        *extra_lines,
     ]
     for index, line in enumerate(lines):
         draw.text((160, 180 + index * 180), line, fill="black", font=font)
+    return image
+
+
+def _real_provider_or_skip():
+    provider = TesseractOCRProvider()
+    availability = provider.check_availability()
+    if not availability.available:
+        pytest.skip(availability.message)
+    return provider, availability
+
+
+@pytest.mark.parametrize("turn", [90, 180])
+def test_real_tesseract_recognizes_rotated_scan_when_available(tmp_path, turn):
+    provider, availability = _real_provider_or_skip()
+    if turn == 90 and "osd" not in availability.languages:
+        pytest.skip("Tesseract-OSD-Daten fehlen; seitliche Seiten werden nicht erkannt.")
+    # OSD needs enough text to decide the orientation reliably.
+    filler = [f"Der Unterricht fand statt im Raum {index} am Vormittag" for index in range(8)]
+    image = _synthetic_legacy_image(filler).rotate(turn, expand=True)
+    source = tmp_path / "rotated.pdf"
+    image.save(source, "PDF", resolution=300.0)
+
+    page = OCRFallbackExtractor(PDFExtractor(), provider).extract_page_data(source)
+    result = FormParser().parse(page)
+
+    assert page.rotation in (90, 180, 270) and page.rotation != 0
+    assert result.form_type == FormType.LEGACY
+    assert result.student_name == "Sample Student"
+
+
+def test_real_tesseract_image_only_pdf_when_available(tmp_path):
+    provider, _availability = _real_provider_or_skip()
+    image = _synthetic_legacy_image()
     source = tmp_path / "anonymous-image-only.pdf"
     image.save(source, "PDF", resolution=300.0)
 

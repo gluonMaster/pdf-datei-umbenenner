@@ -1,15 +1,15 @@
-"""Optional OCR adapter for image-only PDF first pages.
+"""Tesseract OCR adapter for the first page of scanned PDFs.
 
-The module deliberately imports no optional package at import time.  PyMuPDF is
-loaded only after a text-poor page has selected the OCR fallback, so the normal
-application remains usable without OCR dependencies or a Tesseract install.
+PyMuPDF is imported lazily, when the first page is rendered, so a missing or
+broken renderer does not prevent the GUI from starting; processing itself
+requires a working OCR setup.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import importlib
 import io
@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from typing import Iterable, Optional, Tuple
 
-from page_data import ExtractionSource, PageData, PageWord
+from page_data import ExtractionSource, PageData, PageImage, PageWord
 
 
 class OCRStatus(str, Enum):
@@ -76,7 +76,7 @@ class OCRResult:
 
 
 class OCRProvider(ABC):
-    """Boundary used by the PDF fallback and fake test providers."""
+    """Boundary used by the PDF extractor and fake test providers."""
 
     @abstractmethod
     def check_availability(self) -> OCRAvailability:
@@ -89,8 +89,14 @@ class OCRProvider(ABC):
         *,
         page_width: Optional[float] = None,
         page_height: Optional[float] = None,
+        rotation: int = 0,
     ) -> OCRResult:
-        """Render and recognize the first page of ``pdf_path``."""
+        """Render, rotate clockwise and recognize the first page of ``pdf_path``."""
+
+    def detect_rotation(self, image: PageImage) -> Optional[int]:
+        """Clockwise correction of a rendered page, or ``None`` if unknown."""
+
+        return None
 
 
 def ocr_words_to_page_data(
@@ -155,6 +161,14 @@ class TesseractOCRProvider(OCRProvider):
 
     DEFAULT_DPI = 300
     DEFAULT_LANGUAGES = ("deu", "eng")
+    # Sparse-text mode keeps table cells such as the Fach column as separate
+    # words; single-block mode (6) merged or dropped them on real forms.
+    DEFAULT_PAGE_SEGMENTATION_MODE = 11
+    QUERY_TIMEOUT_SECONDS = 20
+    RECOGNITION_TIMEOUT_SECONDS = 120
+    # OSD only orders the single retry; its result is verified by the form
+    # structure, so a modest confidence is enough.
+    MINIMUM_ORIENTATION_CONFIDENCE = 1.0
 
     def __init__(
         self,
@@ -162,7 +176,7 @@ class TesseractOCRProvider(OCRProvider):
         *,
         languages: Iterable[str] = DEFAULT_LANGUAGES,
         dpi: int = DEFAULT_DPI,
-        page_segmentation_mode: int = 6,
+        page_segmentation_mode: Optional[int] = None,
     ) -> None:
         if dpi <= 0:
             raise ValueError("Die OCR-Auflösung (DPI) muss positiv sein.")
@@ -180,9 +194,23 @@ class TesseractOCRProvider(OCRProvider):
         )
         self.languages = requested_languages
         self.dpi = int(dpi)
-        self.page_segmentation_mode = int(page_segmentation_mode)
+        self.page_segmentation_mode = int(
+            self.DEFAULT_PAGE_SEGMENTATION_MODE
+            if page_segmentation_mode is None
+            else page_segmentation_mode
+        )
+        # Only a successful check is reused: after installing Tesseract a new
+        # check must see it, while a working engine is not queried per file.
+        self._available: Optional[OCRAvailability] = None
 
-    def check_availability(self) -> OCRAvailability:
+    def check_availability(self, *, refresh: bool = False) -> OCRAvailability:
+        if self._available is not None and not refresh:
+            return self._available
+        availability = self._query_availability()
+        self._available = availability if availability.available else None
+        return availability
+
+    def _query_availability(self) -> OCRAvailability:
         executable = self._find_executable()
         if executable is None:
             return OCRAvailability(
@@ -204,7 +232,10 @@ class TesseractOCRProvider(OCRProvider):
         del module
 
         try:
-            completed = self._run([str(executable), "--list-langs"])
+            completed = self._run(
+                [str(executable), "--list-langs"],
+                timeout=self.QUERY_TIMEOUT_SECONDS,
+            )
         except (OSError, subprocess.SubprocessError) as error:
             return OCRAvailability(
                 False,
@@ -250,30 +281,40 @@ class TesseractOCRProvider(OCRProvider):
         *,
         page_width: Optional[float] = None,
         page_height: Optional[float] = None,
+        rotation: int = 0,
     ) -> OCRResult:
+        """Render, optionally rotate clockwise, and recognize the first page.
+
+        Coordinates use the rendered (upright) page, which already applies the
+        PDF ``/Rotate`` entry; ``page_width``/``page_height`` are only a
+        fallback for renderers that cannot report the page size.
+        """
+
         availability = self.check_availability()
         if not availability.available or availability.executable is None:
             return OCRResult.unavailable(availability.message)
 
         try:
-            png_bytes, image_width, image_height, rendered_width, rendered_height = (
-                self._render_first_page(Path(pdf_path))
+            image, rendered_width, rendered_height = self._render_first_page(
+                Path(pdf_path), rotation
             )
-            target_width = float(page_width or rendered_width)
-            target_height = float(page_height or rendered_height)
-            command = [
-                str(availability.executable),
-                "stdin",
-                "stdout",
-                "-l",
-                "+".join(self.languages),
-                "--dpi",
-                str(self.dpi),
-                "--psm",
-                str(self.page_segmentation_mode),
-                "tsv",
-            ]
-            completed = self._run(command, input_bytes=png_bytes)
+            target_width = float(rendered_width or page_width or image.width)
+            target_height = float(rendered_height or page_height or image.height)
+            completed = self._run(
+                [
+                    str(availability.executable),
+                    "stdin",
+                    "stdout",
+                    "-l",
+                    "+".join(self.languages),
+                    "--dpi",
+                    str(image.dpi),
+                    "--psm",
+                    str(self.page_segmentation_mode),
+                    "tsv",
+                ],
+                input_bytes=image.png,
+            )
             if completed.returncode != 0:
                 detail = (
                     self._decode(completed.stderr).strip()
@@ -287,16 +328,66 @@ class TesseractOCRProvider(OCRProvider):
                 )
             page_data = ocr_words_to_page_data(
                 words,
-                image_width=image_width,
-                image_height=image_height,
+                image_width=image.width,
+                image_height=image.height,
                 page_width=target_width,
                 page_height=target_height,
             )
-            return OCRResult.success(page_data)
+            return OCRResult.success(
+                replace(page_data, image=image, rotation=rotation % 360)
+            )
         except Exception as error:
             return OCRResult.failed(
                 f"OCR fehlgeschlagen: {str(error).strip() or error.__class__.__name__}"
             )
+
+    def detect_rotation(self, image: PageImage) -> Optional[int]:
+        """Return the clockwise correction suggested by Tesseract OSD, if any.
+
+        Tesseract reports ``Rotate`` counter-clockwise; it is converted to the
+        clockwise convention of ``recognize_first_page``. ``None`` means that
+        OSD data is missing or the result is unreliable.
+        """
+
+        availability = self.check_availability()
+        if (
+            not availability.available
+            or availability.executable is None
+            or "osd" not in availability.languages
+        ):
+            return None
+        try:
+            completed = self._run(
+                [
+                    str(availability.executable),
+                    "stdin",
+                    "stdout",
+                    "--dpi",
+                    str(image.dpi),
+                    "--psm",
+                    "0",
+                ],
+                input_bytes=image.png,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        values = {}
+        for line in self._decode(completed.stdout).splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                values[key.strip().casefold()] = value.strip()
+        try:
+            rotate = (360 - int(values["rotate"])) % 360
+            confidence = float(values["orientation confidence"])
+        except (KeyError, ValueError):
+            return None
+        if rotate not in (0, 90, 180, 270):
+            return None
+        if confidence < self.MINIMUM_ORIENTATION_CONFIDENCE:
+            return None
+        return rotate
 
     def _find_executable(self) -> Optional[Path]:
         candidates: list[Path] = []
@@ -336,7 +427,16 @@ class TesseractOCRProvider(OCRProvider):
     def _render_first_page(
         self,
         pdf_path: Path,
-    ) -> Tuple[bytes, int, int, float, float]:
+        rotation: int = 0,
+    ) -> Tuple[PageImage, float, float]:
+        """Render the visible first page, rotated clockwise by ``rotation``.
+
+        Returns the image and the page size in points in the same orientation.
+        """
+
+        rotation %= 360
+        if rotation not in (0, 90, 180, 270):
+            raise ValueError("Drehung muss ein Vielfaches von 90 Grad sein.")
         pymupdf = self._load_pymupdf()
         document = pymupdf.open(str(pdf_path))
         try:
@@ -344,23 +444,31 @@ class TesseractOCRProvider(OCRProvider):
                 raise ValueError("PDF enthält keine Seiten.")
             page = document[0]
             scale = self.dpi / 72.0
-            matrix = pymupdf.Matrix(scale, scale)
+            matrix = pymupdf.Matrix(scale, scale).prerotate(rotation)
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            width, height = float(page.rect.width), float(page.rect.height)
+            if rotation in (90, 270):
+                width, height = height, width
             return (
-                pixmap.tobytes("png"),
-                int(pixmap.width),
-                int(pixmap.height),
-                float(page.rect.width),
-                float(page.rect.height),
+                PageImage(
+                    pixmap.tobytes("png"),
+                    int(pixmap.width),
+                    int(pixmap.height),
+                    self.dpi,
+                ),
+                width,
+                height,
             )
         finally:
             document.close()
 
-    @staticmethod
+    @classmethod
     def _run(
+        cls,
         command: list[str],
         *,
         input_bytes: Optional[bytes] = None,
+        timeout: Optional[float] = None,
     ) -> subprocess.CompletedProcess[bytes]:
         startupinfo = None
         if os.name == "nt":
@@ -373,7 +481,7 @@ class TesseractOCRProvider(OCRProvider):
             stderr=subprocess.PIPE,
             check=False,
             startupinfo=startupinfo,
-            timeout=120,
+            timeout=cls.RECOGNITION_TIMEOUT_SECONDS if timeout is None else timeout,
         )
 
     @staticmethod
@@ -391,7 +499,13 @@ class TesseractOCRProvider(OCRProvider):
 
     @staticmethod
     def _parse_tsv(output: str) -> Tuple[OCRWord, ...]:
-        reader = csv.DictReader(io.StringIO(output), delimiter="\t")
+        # Tesseract TSV has no quoting: a recognized word starting with '"'
+        # must not open a quoted field that swallows the following rows.
+        reader = csv.DictReader(
+            io.StringIO(output),
+            delimiter="\t",
+            quoting=csv.QUOTE_NONE,
+        )
         words = []
         for row in reader:
             text = str(row.get("text", "") or "").strip()

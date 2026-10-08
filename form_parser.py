@@ -641,8 +641,24 @@ class FormParser:
         self.attendance_parser = AttendanceFormParser()
 
     def parse(self, page: PageData) -> FormParseResult:
+        diagnostics = tuple(page.diagnostics)
         detection = self.detector.detect(page)
-        detection = replace(detection, reasons=tuple(page.diagnostics) + detection.reasons)
+        if detection.form_type == FormType.UNKNOWN:
+            # Field-level merging of readings follows later; here an alternative
+            # reading (the PDF text layer) is used only when the primary one
+            # shows no form structure at all.
+            for alternative in getattr(page, "alternatives", ()):
+                alternative_detection = self.detector.detect(alternative)
+                if alternative_detection.form_type != FormType.UNKNOWN:
+                    page = alternative
+                    detection = replace(
+                        alternative_detection,
+                        reasons=(
+                            "Formularstruktur nur in der Textebene der PDF erkannt.",
+                        ) + alternative_detection.reasons,
+                    )
+                    break
+        detection = replace(detection, reasons=diagnostics + detection.reasons)
         if detection.form_type == FormType.LEGACY:
             return self.legacy_parser.parse(page, detection)
         if detection.form_type == FormType.ATTENDANCE:

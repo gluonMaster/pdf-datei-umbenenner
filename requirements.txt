@@ -1,2 +1,5 @@
-# Direct mandatory runtime dependency. Transitive packages are resolved by pip.
+# Direct mandatory runtime dependencies. Transitive packages are resolved by pip.
 pdfplumber>=0.7.0
+# First-page rendering for OCR, which reads every document.
+# Tesseract with German language data is a separate system install.
+PyMuPDF>=1.27,<1.29

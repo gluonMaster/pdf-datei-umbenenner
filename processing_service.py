@@ -215,6 +215,11 @@ class DocumentProcessingService:
 
             current_stage = ProcessingStage.PARSING
             raw_parse_result = self._parse(extraction)
+            # Page bitmaps are only needed while parsing; results of a whole
+            # batch must not keep them in memory.
+            release_image = getattr(extraction, "without_image", None)
+            if callable(release_image):
+                extraction = release_image()
             found_data, form_type = self._found_data(raw_parse_result)
             stages.append(ProcessingStage.PARSING)
             warnings.extend(found_data.warnings)

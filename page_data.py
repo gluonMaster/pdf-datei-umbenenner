@@ -1,6 +1,6 @@
 """Structured data extracted from the first page of a document."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable, Optional, Tuple
 
@@ -44,8 +44,24 @@ class PageCharacter:
 
 
 @dataclass(frozen=True)
+class PageImage:
+    """Rendered page image, kept only while one document is processed."""
+
+    png: bytes = field(repr=False)
+    width: int
+    height: int
+    dpi: int
+
+
+@dataclass(frozen=True)
 class PageData:
-    """Full text and positioned elements from one page."""
+    """Full text and positioned elements from one page.
+
+    ``alternatives`` holds further independent readings of the same page, for
+    example the embedded text layer next to an OCR reading. ``rotation`` is the
+    clockwise angle applied to the rendered page so that its content is
+    upright; all coordinates refer to that upright page.
+    """
 
     width: float
     height: float
@@ -55,12 +71,33 @@ class PageData:
     source: ExtractionSource = ExtractionSource.PDF_TEXT
     diagnostics: Tuple[str, ...] = field(default_factory=tuple)
     ocr_status: Optional[str] = None
+    alternatives: Tuple["PageData", ...] = field(default_factory=tuple)
+    rotation: int = 0
+    image: Optional[PageImage] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Accept lists from adapters and synthetic tests while exposing immutable data.
         object.__setattr__(self, "words", tuple(self.words))
         object.__setattr__(self, "characters", tuple(self.characters))
         object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+        object.__setattr__(self, "alternatives", tuple(self.alternatives))
+
+    @property
+    def readings(self) -> Tuple["PageData", ...]:
+        """This reading followed by its alternatives."""
+
+        return (self, *self.alternatives)
+
+    def without_image(self) -> "PageData":
+        """Drop rendered images so results do not keep page bitmaps alive."""
+
+        if self.image is None and all(item.image is None for item in self.alternatives):
+            return self
+        return replace(
+            self,
+            image=None,
+            alternatives=tuple(item.without_image() for item in self.alternatives),
+        )
 
     @property
     def chars(self) -> Tuple[PageCharacter, ...]:

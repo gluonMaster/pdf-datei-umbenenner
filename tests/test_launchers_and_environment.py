@@ -223,8 +223,10 @@ def test_dependency_groups_are_separate():
     assert "pdfplumber" in core
     assert "PyInstaller" not in core
     assert "six>=" not in core
-    assert "PyMuPDF" not in core
-    assert "PyMuPDF" in ocr
+    # Since scan_recognition_v3 every page is OCR-rendered, so the renderer is a
+    # core dependency. It stays in requirements-ocr.txt until the installer
+    # stage replaces the optional OCR branch that repairs it.
+    assert "PyMuPDF>=1.27,<1.29" in core
     assert "PyMuPDF>=1.27,<1.29" in ocr
     assert "pytest" in dev
 

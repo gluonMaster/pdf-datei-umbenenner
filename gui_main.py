@@ -17,7 +17,7 @@ from file_opener import FileOpener
 from file_renamer import FileRenamer
 from form_parser import FormParser
 from gui_processing import BatchRunner, BatchSettings, WorkerEventKind
-from pdf_extractor import OCRFallbackExtractor
+from pdf_extractor import OCR_SETUP_HINT, OCRFallbackExtractor, ocr_unavailable_reason
 from processing_service import DocumentProcessingService, PlannedAction
 from review_actions import (
     ReviewActionRequest,
@@ -1198,6 +1198,14 @@ class PDFRenamerGUI:
             return
         if self.processing:
             messagebox.showwarning("Warnung", "Verarbeitung läuft bereits.")
+            return
+        ocr_problem = ocr_unavailable_reason(getattr(self, "extractor", None))
+        if ocr_problem:
+            self.log_message(f"❌ {ocr_problem}")
+            messagebox.showerror(
+                "OCR nicht verfügbar",
+                f"{ocr_problem}\n\n{OCR_SETUP_HINT}",
+            )
             return
 
         # All Tk variables are read exactly once on the main thread.  The

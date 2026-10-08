@@ -67,6 +67,9 @@ class EvaluationRow:
     expected: str
     decided: str
     seconds: float
+    form_detected: Optional[bool] = None
+    name_read: Optional[bool] = None
+    subject_read: Optional[bool] = None
 
 
 def _normalize(value: str) -> str:
@@ -176,6 +179,29 @@ def classify(
     return Outcome.ERROR
 
 
+def field_readings(expectation: Optional[Expectation], result):
+    """Whether form type, raw name and canonical subject were read correctly.
+
+    Field checks are independent of the final decision, so they show where
+    recognition loses information. Without a reference they are ``None``.
+    """
+
+    form_type = getattr(result, "form_type", None)
+    form_detected = None if form_type is None else form_type != "unknown"
+    if expectation is None:
+        return form_detected, None, None
+    found = getattr(result, "found_data", None)
+    raw_name = getattr(found, "raw_student_name", None) or ""
+    tokens = raw_name.split()
+    name_read = bool(tokens) and expectation.student_key in {
+        _normalize("_".join(tokens)),
+        _normalize("_".join(tokens[1:] + tokens[:1])),
+    }
+    subject = getattr(found, "subject", None) or ""
+    subject_read = _normalize(subject) == _normalize(expectation.subject)
+    return form_detected, name_read, subject_read
+
+
 def exit_code(rows: Iterable[EvaluationRow], data_changed: bool) -> int:
     if data_changed:
         return EXIT_DATA_CHANGED
@@ -231,6 +257,14 @@ def format_summary(rows: Sequence[EvaluationRow]) -> List[str]:
     seconds = [row.seconds for row in rows]
     lines = [f"Dokumente: {len(rows)}"]
     lines.extend(f"  {outcome.value}: {counts[outcome]}" for outcome in Outcome)
+    for label, attribute in (
+        ("Formulartyp erkannt", "form_detected"),
+        ("Name korrekt gelesen", "name_read"),
+        ("Fach korrekt gelesen", "subject_read"),
+    ):
+        values = [getattr(row, attribute) for row in rows if getattr(row, attribute) is not None]
+        if values:
+            lines.append(f"{label}: {sum(values)}/{len(values)}")
     if seconds:
         lines.append(
             f"Zeit pro Dokument: Mittel {sum(seconds) / len(seconds):.2f} s, "
@@ -313,6 +347,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tesseract_path=args.tesseract_path,
         registry_csv=registry_csv,
     )
+    from pdf_extractor import ocr_unavailable_reason
+
+    ocr_problem = ocr_unavailable_reason(getattr(service, "extractor", None))
+    if ocr_problem:
+        print(f"Fehler: {ocr_problem}")
+        return EXIT_USAGE
     registry = service.student_registry
     if not registry.is_available:
         print(f"Fehler: Schülerverzeichnis nicht verfügbar: {registry.load_error}")
@@ -350,12 +390,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _describe_expected(expectation),
             _describe_decision(result),
             elapsed,
+            *field_readings(expectation, result),
         ))
 
     data_changed = snapshot(folder, data_files) != before
 
+    def mark(value):
+        return "?" if value is None else ("ja" if value else "nein")
+
     detail = [
-        f"{row.file_name}\t{row.outcome.value}\t{row.seconds:.2f} s\n"
+        f"{row.file_name}\t{row.outcome.value}\t{row.seconds:.2f} s\t"
+        f"Formular {mark(row.form_detected)}, Name {mark(row.name_read)}, "
+        f"Fach {mark(row.subject_read)}\n"
         f"    erwartet:    {row.expected}\n"
         f"    entschieden: {row.decided}"
         for row in rows
