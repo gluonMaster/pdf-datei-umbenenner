@@ -25,6 +25,55 @@ from text_parser import TextParser
 from validator import Validator
 
 
+def build_processing_service(
+    input_folder: Path,
+    *,
+    tesseract_path: Optional[str] = None,
+    registry_csv: Optional[Path] = None,
+) -> DocumentProcessingService:
+    """Assemble the CLI pipeline for one input folder.
+
+    ``registry_csv`` replaces the project registry, for example with a
+    temporary copy; its aliases are read from the file next to it.
+    """
+
+    project_folder = Path(__file__).parent
+    input_folder = Path(input_folder)
+    # Explicitly bind the parser to this application's alias store.
+    # This prevents a GUI or test created earlier in the same Python
+    # process from leaking its singleton manager into the CLI.
+    TextParser.set_alias_manager(
+        AliasManager(
+            project_folder / "subjects_aliases.json",
+            create_if_missing=False,
+        )
+    )
+    if registry_csv is None:
+        registry_paths = StudentRegistryPaths.in_directory(project_folder)
+    else:
+        registry_csv = Path(registry_csv)
+        registry_paths = StudentRegistryPaths(
+            registry_csv, registry_csv.with_name("student_aliases.json")
+        )
+    review_store = ReviewStore(input_folder / "manual_review.json")
+    review_store.load()
+    return DocumentProcessingService(
+        extractor=OCRFallbackExtractor(
+            PDFExtractor(),
+            TesseractOCRProvider(tesseract_path),
+        ),
+        parser=FormParser(),
+        student_registry=StudentRegistry(
+            registry_paths.csv_path,
+            registry_paths.aliases_path,
+        ),
+        validator=Validator(),
+        review_store=review_store,
+        renamer=FileRenamer(),
+        manual_review_folder=input_folder / "manual_check",
+    )
+
+
 class PDFRenamerApp:
     """Thin CLI facade retained for callers of the original application API."""
 
@@ -47,33 +96,9 @@ class PDFRenamerApp:
         self.manual_check_folder = self.input_folder / "manual_check"
 
         if service is None:
-            project_folder = Path(__file__).parent
-            # Explicitly bind the parser to this application's alias store.
-            # This prevents a GUI or test created earlier in the same Python
-            # process from leaking its singleton manager into the CLI.
-            TextParser.set_alias_manager(
-                AliasManager(
-                    project_folder / "subjects_aliases.json",
-                    create_if_missing=False,
-                )
-            )
-            registry_paths = StudentRegistryPaths.in_directory(project_folder)
-            review_store = ReviewStore(self.input_folder / "manual_review.json")
-            review_store.load()
-            service = DocumentProcessingService(
-                extractor=OCRFallbackExtractor(
-                    PDFExtractor(),
-                    TesseractOCRProvider(tesseract_path),
-                ),
-                parser=FormParser(),
-                student_registry=StudentRegistry(
-                    registry_paths.csv_path,
-                    registry_paths.aliases_path,
-                ),
-                validator=Validator(),
-                review_store=review_store,
-                renamer=FileRenamer(),
-                manual_review_folder=self.manual_check_folder,
+            service = build_processing_service(
+                self.input_folder,
+                tesseract_path=tesseract_path,
             )
         self.service = service
         # Compatibility attributes for integrations that inspect the facade.

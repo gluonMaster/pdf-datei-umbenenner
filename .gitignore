@@ -48,3 +48,7 @@ bootstrap-*.tmp
 /manual_review.json
 /scans/
 /Scans/
+
+# Local recognition reference and stand reports (contain names)
+_expected.csv
+recognition_report*
