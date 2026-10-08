@@ -18,6 +18,7 @@ from student_registry import (
     _parse_active,
     _parse_student_number,
     normalize_name,
+    parse_birth_date_cell,
 )
 
 
@@ -229,8 +230,8 @@ class StudentRegistryService:
                 *(existing_aliases.get(alias_key, set()) for alias_key in alias_keys)
             )
             if same_number is not None:
-                if same_number == student:
-                    unchanged.append(student)
+                if self._same_record(same_number, student):
+                    unchanged.append(same_number)
                 else:
                     conflicts.append(
                         ImportIssue(
@@ -317,6 +318,20 @@ class StudentRegistryService:
 
     def _registry_fingerprint(self) -> str:
         return self.registry.checked_fingerprint()
+
+    @staticmethod
+    def _same_record(existing: Student, imported: Student) -> bool:
+        """Equal rows; a birth date known on only one side is no conflict."""
+
+        if (existing.last_name, existing.first_name, existing.active) != (
+            imported.last_name, imported.first_name, imported.active
+        ):
+            return False
+        return (
+            existing.birth_date is None
+            or imported.birth_date is None
+            or existing.birth_date == imported.birth_date
+        )
 
     @staticmethod
     def _name_key(student: Student) -> tuple[str, str]:
@@ -409,6 +424,11 @@ class StudentRegistryService:
                             f"Zeile {row_number}: Forname und Vorname widersprechen sich."
                         )
                 active_value = row.get(header_map["aktiv"]) if "aktiv" in header_map else None
+                birth_date = (
+                    parse_birth_date_cell(row.get(header_map["geburtsdatum"]), f"Zeile {row_number}")
+                    if "geburtsdatum" in header_map
+                    else None
+                )
                 imported.append(
                     _ImportRow(
                         row_number,
@@ -417,6 +437,7 @@ class StudentRegistryService:
                             last_name,
                             first_name,
                             _parse_active(active_value, row_number),
+                            birth_date,
                         ),
                     )
                 )

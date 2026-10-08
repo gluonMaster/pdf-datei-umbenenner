@@ -49,6 +49,10 @@ class ReviewItem:
     birth_date: Optional[str] = None
     subject_proposal: Optional[str] = None
     field_evidence: List[dict] = field(default_factory=list)
+    # Ranked registry candidates ({number, name, score}) and, for an unknown
+    # student, the recognized values ({last_name, first_name, birth_date}).
+    student_candidates: List[dict] = field(default_factory=list)
+    new_student_proposal: Optional[dict] = None
     
     def to_dict(self) -> dict:
         """Преобразует ReviewItem в словарь"""
@@ -71,6 +75,7 @@ class ReviewItem:
         payload.setdefault("parser_reasons", [])
         payload.setdefault("student_suggestions", [])
         payload.setdefault("field_evidence", [])
+        payload.setdefault("student_candidates", [])
         item = cls(**payload)
         item._validate_types()
         return item
@@ -103,10 +108,14 @@ class ReviewItem:
             if value is not None and not isinstance(value, str):
                 raise TypeError(f"'{field_name}' muss Text oder null sein")
 
-        if not isinstance(self.field_evidence, list) or not all(
-            isinstance(entry, dict) for entry in self.field_evidence
+        for field_name in ("field_evidence", "student_candidates"):
+            value = getattr(self, field_name)
+            if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
+                raise TypeError(f"'{field_name}' muss eine Liste von JSON-Objekten sein")
+        if self.new_student_proposal is not None and not isinstance(
+            self.new_student_proposal, dict
         ):
-            raise TypeError("'field_evidence' muss eine Liste von JSON-Objekten sein")
+            raise TypeError("'new_student_proposal' muss ein JSON-Objekt oder null sein")
 
         for field_name in ("suggestions", "parser_reasons", "student_suggestions"):
             value = getattr(self, field_name)

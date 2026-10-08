@@ -11,7 +11,7 @@ from typing import Any, Iterable, Optional, Tuple
 from file_renamer import FileRenamer
 from form_parser import FormType
 from review_queue import ReviewItem, ReviewStore
-from student_registry import MatchStatus
+from student_registry import MatchStatus, NameEvidence, format_birth_date
 from validator import ValidationLevel
 
 
@@ -234,8 +234,10 @@ class DocumentProcessingService:
 
             match_name = found_data.student_name or found_data.raw_student_name or ""
             current_stage = ProcessingStage.STUDENT_MATCHING
-            student_match = self._match_student(match_name)
+            student_match = self._match_student(match_name, found_data)
             stages.append(ProcessingStage.STUDENT_MATCHING)
+            if self._match_status(student_match) == MatchStatus.AUTO_CORRECTED.value:
+                warnings.append(str(getattr(student_match, "reason", "")))
 
             current_stage = ProcessingStage.SUBJECT_VALIDATION
             subject_validation = self._validate_subject(found_data.subject)
@@ -312,7 +314,8 @@ class DocumentProcessingService:
                 ocr_status=ocr_status,
                 actual_path=pdf_path,
             )
-            return plan if dry_run else self._execute_plan(plan)
+            result = plan if dry_run else self._execute_plan(plan)
+            return self._learn_birth_date(result)
         except Exception as error:
             return ProcessingResult(
                 pdf_path=pdf_path,
@@ -460,12 +463,99 @@ class DocumentProcessingService:
             form_type,
         )
 
-    def _match_student(self, raw_name: str) -> Any:
+    def _match_student(
+        self,
+        raw_name: str,
+        found_data: Optional[FoundDocumentData] = None,
+    ) -> Any:
+        identify = getattr(self.student_registry, "identify", None)
+        evidence = self._name_evidence(found_data) if found_data is not None else None
+        if callable(identify) and evidence is not None:
+            return identify(evidence)
         for method_name in ("match", "match_name", "resolve"):
             method = getattr(self.student_registry, method_name, None)
             if callable(method):
                 return method(raw_name)
         raise TypeError("Student registry has no supported match method.")
+
+    @staticmethod
+    def _field_evidence(found_data: FoundDocumentData, name: str) -> Any:
+        return next(
+            (item for item in found_data.evidence if getattr(item, "field", None) == name),
+            None,
+        )
+
+    @classmethod
+    def _name_evidence(cls, found_data: FoundDocumentData) -> Optional[NameEvidence]:
+        """All readings of the name field, if the parser recorded them."""
+
+        evidence = cls._field_evidence(found_data, "student_name")
+        readings = tuple(
+            (str(reading.source), str(reading.value))
+            for reading in (getattr(evidence, "readings", ()) or ())
+            if getattr(reading, "value", None)
+        )
+        if not readings:
+            return None
+        return NameEvidence(
+            readings,
+            localized=getattr(evidence, "localization", None) is not None,
+            birth_date=cls._clean_birth_date(found_data),
+        )
+
+    @classmethod
+    def _clean_birth_date(cls, found_data: FoundDocumentData) -> Optional[date]:
+        """The recognized birth date if no reading contradicts it."""
+
+        evidence = cls._field_evidence(found_data, "birth_date")
+        if found_data.birth_date is None or evidence is None:
+            return None
+        if getattr(evidence, "uncertainties", ()):
+            return None
+        return found_data.birth_date
+
+    def _learn_birth_date(self, result: ProcessingResult) -> ProcessingResult:
+        """Remember a cleanly read birth date of an exactly identified student.
+
+        Only exact names or confirmed aliases teach the registry; automatic
+        corrections never do, so a misidentification cannot become evidence.
+        """
+
+        if result.error or result.planned_action != PlannedAction.RENAME:
+            return result
+        if self._match_status(result.student_match) != MatchStatus.EXACT.value:
+            return result
+        student = getattr(result.student_match, "student", None)
+        learn = getattr(self.student_registry, "learn_birth_date", None)
+        if student is None or result.found_data is None or not callable(learn):
+            return result
+        birth_date = self._clean_birth_date(result.found_data)
+        if birth_date is None or getattr(student, "birth_date", None) is not None:
+            return result
+        text = format_birth_date(birth_date)
+        if result.dry_run:
+            note = f"Geburtsdatum {text} würde in das Schülerverzeichnis übernommen."
+        elif result.performed_action != PerformedAction.RENAMED:
+            return result
+        else:
+            try:
+                outcome = learn(student.number, birth_date)
+            except Exception as error:
+                outcome = None
+                note = (
+                    f"Geburtsdatum {text} konnte nicht in das Schülerverzeichnis "
+                    f"übernommen werden: {error}"
+                )
+            if outcome == "stored":
+                note = f"Geburtsdatum {text} in das Schülerverzeichnis übernommen."
+            elif outcome == "conflict":
+                note = (
+                    f"Geburtsdatum {text} weicht vom Schülerverzeichnis ab; "
+                    "es wurde nicht geändert."
+                )
+            elif outcome == "known":
+                return result
+        return replace(result, warnings=tuple(dict.fromkeys((*result.warnings, note))))
 
     def _validate_subject(self, subject: Optional[str]) -> Any:
         method = getattr(self.validator, "validate_subject", None)
@@ -509,7 +599,8 @@ class DocumentProcessingService:
             reasons.append("Fach wurde nicht gefunden.")
 
         status = self._match_status(student_match)
-        if status != MatchStatus.EXACT.value or getattr(student_match, "student", None) is None:
+        accepted = (MatchStatus.EXACT.value, MatchStatus.AUTO_CORRECTED.value)
+        if status not in accepted or getattr(student_match, "student", None) is None:
             match_reason = str(getattr(student_match, "reason", "") or "")
             reasons.append(match_reason or "Schüler muss manuell bestätigt werden.")
 
@@ -587,6 +678,16 @@ class DocumentProcessingService:
                 item.to_dict() for item in found_data.evidence
                 if callable(getattr(item, "to_dict", None))
             ],
+            student_candidates=[
+                {
+                    "number": getattr(item.student, "number", None),
+                    "name": getattr(item.student, "full_name", str(item.student)),
+                    "score": round(float(item.score), 4),
+                }
+                for item in (getattr(student_match, "ranked_suggestions", ()) or ())
+                if hasattr(item, "student") and hasattr(item, "score")
+            ],
+            new_student_proposal=self._proposal_dict(student_match),
         )
 
         return ProcessingResult(
@@ -609,6 +710,18 @@ class DocumentProcessingService:
             ocr_status=getattr(extraction, "ocr_status", None),
             actual_path=pdf_path,
         )
+
+    @staticmethod
+    def _proposal_dict(student_match: Any) -> Optional[dict]:
+        proposal = getattr(student_match, "new_student_proposal", None)
+        if proposal is None:
+            return None
+        birth_date = getattr(proposal, "birth_date", None)
+        return {
+            "last_name": proposal.last_name,
+            "first_name": proposal.first_name,
+            "birth_date": birth_date.isoformat() if birth_date else None,
+        }
 
     def _execute_plan(self, plan: ProcessingResult) -> ProcessingResult:
         """Execute a complete plan, retaining it even after an action fails."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from enum import Enum
 import hashlib
@@ -20,13 +21,23 @@ from pathlib import Path
 import shutil
 import tempfile
 import unicodedata
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from name_matching import (
+    NameComparison,
+    compare_birth_dates,
+    compare_name,
+    proposal_parts,
+    same_spelling,
+)
 
 
 class MatchStatus(str, Enum):
     """Outcome of matching a parsed name against the registry."""
 
     EXACT = "exact"
+    # An OCR spelling corrected to one registry student on sufficient evidence.
+    AUTO_CORRECTED = "auto_corrected"
     UNKNOWN = "unknown"
     AMBIGUOUS = "ambiguous"
     ERROR = "error"
@@ -40,6 +51,7 @@ class Student:
     last_name: str
     first_name: str
     active: bool = True
+    birth_date: Optional[date] = None
 
     @property
     def full_name(self) -> str:
@@ -64,6 +76,10 @@ class Student:
     def forname(self) -> str:
         return self.first_name
 
+    @property
+    def geburtsdatum(self) -> Optional[date]:
+        return self.birth_date
+
 
 @dataclass(frozen=True)
 class StudentAlias:
@@ -82,6 +98,29 @@ class StudentSuggestion:
 
 
 @dataclass(frozen=True)
+class NewStudentProposal:
+    """Recognized values offered when the student is not in the registry."""
+
+    last_name: str
+    first_name: str
+    birth_date: Optional[date] = None
+
+
+@dataclass(frozen=True)
+class NameEvidence:
+    """Everything the form reading knows about the student's identity.
+
+    ``readings`` are ``(source, text)`` pairs, the primary reading first.
+    ``localized`` states that the name field was found through the printed
+    form structure. ``birth_date`` is a cleanly read date (readings agree).
+    """
+
+    readings: Tuple[Tuple[str, str], ...]
+    localized: bool = False
+    birth_date: Optional[date] = None
+
+
+@dataclass(frozen=True)
 class StudentMatch:
     """Small integration result consumed after PDF form parsing."""
 
@@ -90,6 +129,11 @@ class StudentMatch:
     suggestions: Tuple[Student, ...]
     reason: str
     ranked_suggestions: Tuple[StudentSuggestion, ...] = ()
+    new_student_proposal: Optional[NewStudentProposal] = None
+    # "match", "near", "contradiction" or None when no comparison was possible.
+    birth_date_check: Optional[str] = None
+    # Reading that decided the match, as "source: text".
+    decided_by: Optional[str] = None
 
     @property
     def canonical_student(self) -> Optional[Student]:
@@ -97,7 +141,7 @@ class StudentMatch:
 
     @property
     def requires_manual_review(self) -> bool:
-        return self.status != MatchStatus.EXACT
+        return self.status not in (MatchStatus.EXACT, MatchStatus.AUTO_CORRECTED)
 
 
 class StudentRegistryError(Exception):
@@ -123,6 +167,30 @@ class _CsvSchema:
     fieldnames: Tuple[str, ...] = ()
     extra_values: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
     encoding: str = "utf-8-sig"
+    has_birth_date: bool = False
+
+
+BIRTH_DATE_HEADER = "Geburtsdatum"
+BIRTH_DATE_FORMAT = "%d.%m.%Y"
+
+
+def format_birth_date(value: Optional[date]) -> str:
+    return value.strftime(BIRTH_DATE_FORMAT) if value else ""
+
+
+def parse_birth_date_cell(value: object, row_label: str) -> Optional[date]:
+    """Parse ``TT.MM.JJJJ``; an empty cell means "unknown"."""
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.strptime(text, BIRTH_DATE_FORMAT).date()
+    except ValueError as exc:
+        raise RegistryValidationError(
+            f"{row_label}: Geburtsdatum muss das Format TT.MM.JJJJ haben; erhalten: {text!r}."
+        ) from exc
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -193,6 +261,9 @@ def _unique_json_object(pairs):
             raise RegistryValidationError(f"Doppelter Schlüssel in Alias-JSON: {key!r}.")
         result[key] = value
     return result
+
+
+_KEEP = object()
 
 
 class StudentRegistry:
@@ -423,6 +494,276 @@ class StudentRegistry:
     match_name = match
     resolve = match
 
+    # Thresholds of :meth:`identify`, calibrated on the measurement stand and
+    # synthetic negative cases. Scores measure similarity, not probability.
+    AUTO_SCORE = 0.85
+    AUTO_PART_SCORE = 0.75
+    AUTO_MARGIN = 0.25
+    BIRTH_DATE_AUTO_SCORE = 0.70
+    BIRTH_DATE_AUTO_PART_SCORE = 0.55
+    BIRTH_DATE_MAX_REAL_EDITS = 2
+    SUGGESTION_SCORE = 0.55
+    TEXT_LAYER_SOURCE = "text_layer"
+
+    def identify(self, evidence: NameEvidence) -> StudentMatch:
+        """Identify a student from all readings of the name field.
+
+        An exact name or confirmed alias in any reading is ``EXACT`` unless
+        another reading points to a different student or the birth date
+        contradicts. Without an exact match, a single candidate is accepted as
+        ``AUTO_CORRECTED`` only if the field was located on the form, the
+        reading differs from the candidate solely by typical OCR confusions,
+        the candidate leads clearly and nothing contradicts it. A matching
+        stored birth date permits a few more errors. Everything else is left
+        for manual review with ranked candidates or a new-student proposal.
+        Nothing is written: aliases are only created by explicit confirmation.
+        """
+
+        if not self.is_available:
+            return self.match("")
+        readings = tuple(
+            (str(source), " ".join(str(text).split()))
+            for source, text in evidence.readings
+            if text and str(text).strip()
+        )
+        if not readings:
+            return self.match("")
+
+        exact: Dict[int, List[Tuple[str, str]]] = {}
+        for source, text in readings:
+            found = self._exact_candidates(normalize_name(text))
+            if len(found) > 1:
+                return self._match_key(normalize_name(text), found)
+            if found:
+                exact.setdefault(found[0].number, []).append((source, text))
+        scored = {reading: self._scored_candidates(reading[1]) for reading in readings}
+
+        if len(exact) > 1:
+            return self._review_match(
+                MatchStatus.AMBIGUOUS,
+                "Die Lesungen des Namens verweisen auf verschiedene Schüler.",
+                readings, scored, evidence,
+            )
+        if exact:
+            number, sources = next(iter(exact.items()))
+            student = self._students_by_number[number]
+            conflict = self._contradicting_reading(student, readings, scored)
+            if conflict:
+                return self._review_match(
+                    MatchStatus.AMBIGUOUS, conflict, readings, scored, evidence
+                )
+            check = self._birth_date_check(student, evidence.birth_date)
+            if check == "contradiction":
+                return self._review_match(
+                    MatchStatus.AMBIGUOUS,
+                    self._birth_date_conflict_reason(student, evidence.birth_date),
+                    readings, scored, evidence, birth_date_check=check,
+                )
+            source, text = sources[0]
+            via = "" if source == readings[0][0] else f" (Lesung {source})"
+            return StudentMatch(
+                MatchStatus.EXACT,
+                student,
+                (),
+                f"Exakter Treffer im Schülerverzeichnis oder über einen bestätigten Alias "
+                f"für Schüler Nr. {student.number}{via}.",
+                birth_date_check=check,
+                decided_by=f"{source}: {text}",
+            )
+
+        best = self._best_fuzzy(readings, scored)
+        if best is None:
+            return self._review_match(
+                MatchStatus.UNKNOWN,
+                "Kein exakter Schüler oder bestätigter Alias gefunden; "
+                "eine manuelle Bestätigung ist erforderlich.",
+                readings, scored, evidence,
+            )
+        reading, comparison, student, margin = best
+        if comparison.score < self.BIRTH_DATE_AUTO_SCORE:
+            return self._review_match(
+                MatchStatus.UNKNOWN,
+                "Kein passender Schüler im Verzeichnis gefunden; vermutlich ein neuer "
+                "Schüler. Bitte neu anlegen oder einen bestehenden Schüler auswählen.",
+                readings, scored, evidence,
+            )
+        check = self._birth_date_check(student, evidence.birth_date)
+        conflict = self._contradicting_reading(student, readings, scored)
+        name_only = (
+            comparison.real_edits == 0
+            and comparison.score >= self.AUTO_SCORE
+            and comparison.minimum_part_score >= self.AUTO_PART_SCORE
+        )
+        with_birth_date = (
+            check == "match"
+            and comparison.real_edits <= self.BIRTH_DATE_MAX_REAL_EDITS
+            and comparison.score >= self.BIRTH_DATE_AUTO_SCORE
+            and comparison.minimum_part_score >= self.BIRTH_DATE_AUTO_PART_SCORE
+        )
+        if (
+            evidence.localized
+            and not conflict
+            and check != "contradiction"
+            and margin >= self.AUTO_MARGIN
+            and (name_only or with_birth_date)
+        ):
+            basis = (
+                "nur typische OCR-Verwechslungen"
+                if name_only
+                else "Geburtsdatum stimmt überein"
+            )
+            return StudentMatch(
+                MatchStatus.AUTO_CORRECTED,
+                student,
+                (),
+                f"Name automatisch korrigiert: „{reading[1]}“ -> Schüler Nr. {student.number} "
+                f"({student.full_name}); {basis}, Ähnlichkeit {comparison.score:.2f}, "
+                f"Abstand zum nächsten Kandidaten {margin:.2f}.",
+                (StudentSuggestion(student, comparison.score),),
+                birth_date_check=check,
+                decided_by=f"{reading[0]}: {reading[1]}",
+            )
+
+        status = MatchStatus.UNKNOWN
+        if conflict:
+            reason = conflict
+        elif check == "contradiction":
+            reason = self._birth_date_conflict_reason(student, evidence.birth_date)
+        elif comparison.score >= self.AUTO_SCORE and margin < self.AUTO_MARGIN:
+            status = MatchStatus.AMBIGUOUS
+            reason = "Mehrere ähnlich passende Schüler erfordern eine manuelle Auswahl."
+        else:
+            reason = (
+                "Kein exakter Schüler oder bestätigter Alias gefunden; "
+                "eine manuelle Bestätigung ist erforderlich."
+            )
+        return self._review_match(
+            status, reason, readings, scored, evidence, birth_date_check=check
+        )
+
+    def _scored_candidates(self, text: str) -> Tuple[Tuple[NameComparison, Student], ...]:
+        """Every student with its best comparison over name and aliases."""
+
+        aliases_by_student: Dict[int, List[str]] = {}
+        for alias in self._aliases.values():
+            aliases_by_student.setdefault(alias.student_number, []).append(alias.name)
+        ranked = []
+        for student in self._students:
+            comparisons = [compare_name(text, student.last_name, student.first_name)]
+            for alias_name in aliases_by_student.get(student.number, ()):
+                parts = alias_name.split(maxsplit=1)
+                if len(parts) == 2:
+                    comparisons.append(compare_name(text, parts[0], parts[1]))
+            best = max(comparisons, key=lambda item: (item.score, -item.real_edits))
+            ranked.append((best, student))
+        ranked.sort(key=lambda item: (-item[0].score, item[0].real_edits, item[1].number))
+        return tuple(ranked)
+
+    @staticmethod
+    def _best_fuzzy(readings, scored):
+        """The reading whose leading candidate is closest, with its margin."""
+
+        best = None
+        for reading in readings:
+            candidates = scored[reading]
+            if not candidates:
+                continue
+            comparison, student = candidates[0]
+            second = next(
+                (item[0].score for item in candidates[1:] if item[1].number != student.number),
+                0.0,
+            )
+            entry = (reading, comparison, student, round(comparison.score - second, 4))
+            if best is None or (
+                (comparison.score, -comparison.real_edits)
+                > (best[1].score, -best[1].real_edits)
+            ):
+                best = entry
+        return best
+
+    def _contradicting_reading(self, student: Student, readings, scored) -> Optional[str]:
+        """A reason if another reading supports a different person."""
+
+        for source, text in readings:
+            comparison, leader = scored[(source, text)][0]
+            if (
+                leader.number != student.number
+                and comparison.real_edits == 0
+                and comparison.score >= self.AUTO_SCORE
+            ):
+                return (
+                    f"Die Lesung „{text}“ ({source}) passt zu Schüler Nr. {leader.number}, "
+                    f"nicht zu Nr. {student.number}."
+                )
+        # Independent readings (text layer and OCR) agreeing on a spelling
+        # that differs from the candidate in real letters: another person.
+        text_layer = [text for source, text in readings if source == self.TEXT_LAYER_SOURCE]
+        ocr = [text for source, text in readings if source != self.TEXT_LAYER_SOURCE]
+        for text in text_layer:
+            if any(same_spelling(text, other) for other in ocr):
+                comparison = compare_name(text, student.last_name, student.first_name)
+                if comparison.real_edits > 0 and normalize_name(text) not in self._student_keys(student):
+                    return (
+                        f"Textebene und OCR lesen übereinstimmend „{text}“; "
+                        f"das weicht von Schüler Nr. {student.number} ab."
+                    )
+        return None
+
+    @staticmethod
+    def _birth_date_check(student: Student, read: Optional[date]) -> Optional[str]:
+        if read is None or student.birth_date is None:
+            return None
+        return compare_birth_dates(read, student.birth_date)
+
+    @staticmethod
+    def _birth_date_conflict_reason(student: Student, read: Optional[date]) -> str:
+        return (
+            f"Geburtsdatum auf dem Formular ({format_birth_date(read)}) weicht vom "
+            f"Schülerverzeichnis ab (Nr. {student.number}: "
+            f"{format_birth_date(student.birth_date)})."
+        )
+
+    def _review_match(
+        self,
+        status: MatchStatus,
+        reason: str,
+        readings,
+        scored,
+        evidence: NameEvidence,
+        *,
+        birth_date_check: Optional[str] = None,
+    ) -> StudentMatch:
+        """Ranked candidates over all readings plus a new-student proposal."""
+
+        best_by_number: Dict[int, float] = {}
+        students: Dict[int, Student] = {}
+        for reading in readings:
+            for comparison, student in scored[reading]:
+                if comparison.score < self.SUGGESTION_SCORE:
+                    break
+                if comparison.score > best_by_number.get(student.number, -1.0):
+                    best_by_number[student.number] = comparison.score
+                    students[student.number] = student
+        ranked = tuple(
+            StudentSuggestion(students[number], score)
+            for number, score in sorted(
+                best_by_number.items(), key=lambda item: (-item[1], item[0])
+            )[:self.suggestion_limit]
+        )
+        parts = proposal_parts(readings[0][1])
+        proposal = (
+            NewStudentProposal(parts[0], parts[1], evidence.birth_date) if parts else None
+        )
+        return StudentMatch(
+            status,
+            None,
+            tuple(item.student for item in ranked),
+            reason,
+            ranked,
+            new_student_proposal=proposal,
+            birth_date_check=birth_date_check,
+        )
+
     def select_existing(self, student_number: int) -> Student:
         """Return a manually selected canonical row without changing files."""
 
@@ -495,6 +836,7 @@ class StudentRegistry:
         first_name: str,
         *,
         active: bool = True,
+        birth_date: Optional[date] = None,
     ) -> Student:
         """Explicitly add a canonical student using the next stable number."""
 
@@ -506,11 +848,13 @@ class StudentRegistry:
         self._ensure_unique_canonical(clean_last, clean_first)
 
         number = max(self._students_by_number, default=0) + 1
-        student = Student(number, clean_last, clean_first, active)
+        student = Student(number, clean_last, clean_first, active, birth_date)
         updated = self._students + (student,)
+        self._validate_students_for_write(updated)
         self._validate_alias_conflicts(updated, self._aliases)
         schema = self._schema_or_raise()
         schema = self._ensure_active_schema(schema, required=not active)
+        schema = self._ensure_birth_date_schema(schema, required=birth_date is not None)
         self._write_students(updated, schema)
         self._commit_students(updated, schema)
         return student
@@ -521,10 +865,11 @@ class StudentRegistry:
         first_name: str,
         *,
         active: bool = True,
+        birth_date: Optional[date] = None,
     ) -> Student:
         """Explicit confirmation alias for :meth:`add_student`."""
 
-        return self.add_student(last_name, first_name, active=active)
+        return self.add_student(last_name, first_name, active=active, birth_date=birth_date)
 
     def update_student(
         self,
@@ -533,8 +878,12 @@ class StudentRegistry:
         last_name: Optional[str] = None,
         first_name: Optional[str] = None,
         active: Optional[bool] = None,
+        birth_date: object = _KEEP,
     ) -> Student:
-        """Edit a row while preserving its stable number and aliases."""
+        """Edit a row while preserving its stable number and aliases.
+
+        ``birth_date`` stays unchanged unless given; ``None`` clears it.
+        """
 
         current = self.select_existing(student_number)
         clean_last = (
@@ -548,7 +897,10 @@ class StudentRegistry:
         new_active = current.active if active is None else active
         if not isinstance(new_active, bool):
             raise RegistryValidationError("Der Aktiv-Status muss wahr oder falsch sein.")
-        replacement = Student(current.number, clean_last, clean_first, new_active)
+        new_birth_date = current.birth_date if birth_date is _KEEP else birth_date
+        replacement = Student(
+            current.number, clean_last, clean_first, new_active, new_birth_date
+        )
         if replacement == current:
             return current
         if (normalize_name(clean_last), normalize_name(clean_first)) != (
@@ -559,12 +911,31 @@ class StudentRegistry:
             replacement if item.number == current.number else item
             for item in self._students
         )
+        self._validate_students_for_write(updated)
         self._validate_alias_conflicts(updated, self._aliases)
         schema = self._schema_or_raise()
         schema = self._ensure_active_schema(schema, required=not new_active)
+        schema = self._ensure_birth_date_schema(
+            schema, required=new_birth_date is not None
+        )
         self._write_students(updated, schema)
         self._commit_students(updated, schema)
         return replacement
+
+    def learn_birth_date(self, student_number: int, birth_date: date) -> str:
+        """Store a recognized birth date only if none is known yet.
+
+        Returns ``stored``, ``known`` (same date already stored) or
+        ``conflict`` (another date is stored and stays unchanged).
+        """
+
+        current = self.select_existing(student_number)
+        if current.birth_date == birth_date:
+            return "known"
+        if current.birth_date is not None:
+            return "conflict"
+        self.update_student(current.number, birth_date=birth_date)
+        return "stored"
 
     edit_student = update_student
 
@@ -624,13 +995,24 @@ class StudentRegistry:
         needs_active_migration = (
             not schema.has_active and any(not student.active for student in additions)
         )
+        needs_birth_date_migration = (
+            not schema.has_birth_date
+            and any(student.birth_date is not None for student in additions)
+        )
         backup = (
             self._create_backup(self.csv_path)
             if create_backup or len(additions) > 1 or needs_active_migration
+            or needs_birth_date_migration
             else None
         )
         if needs_active_migration:
             schema = replace(schema, has_active=True, fieldnames=schema.fieldnames + ("Aktiv",))
+        if needs_birth_date_migration:
+            schema = replace(
+                schema,
+                has_birth_date=True,
+                fieldnames=schema.fieldnames + (BIRTH_DATE_HEADER,),
+            )
         self._write_students(updated, schema)
         self._commit_students(updated, schema)
         return backup
@@ -690,7 +1072,7 @@ class StudentRegistry:
             extra_values = {}
             schema = _CsvSchema(
                 first_header, "Aktiv" in header_map, tuple(stripped_headers),
-                extra_values, encoding,
+                extra_values, encoding, BIRTH_DATE_HEADER in header_map,
             )
 
             students = []
@@ -738,15 +1120,30 @@ class StudentRegistry:
                     )
                 extra_values[number] = {
                     name: row[raw_header] for name, raw_header in header_map.items()
-                    if name not in {"Nummer", "Nachname", "Forname", "Vorname", "Aktiv"}
+                    if name not in {
+                        "Nummer", "Nachname", "Forname", "Vorname", "Aktiv", BIRTH_DATE_HEADER,
+                    }
                 }
                 active_value = (
                     row.get(header_map["Aktiv"])
                     if schema.has_active
                     else None
                 )
+                birth_date = (
+                    parse_birth_date_cell(
+                        row.get(header_map[BIRTH_DATE_HEADER]), f"Zeile {row_number}"
+                    )
+                    if schema.has_birth_date
+                    else None
+                )
                 students.append(
-                    Student(number, last_name, first_name, _parse_active(active_value, row_number))
+                    Student(
+                        number,
+                        last_name,
+                        first_name,
+                        _parse_active(active_value, row_number),
+                        birth_date,
+                    )
                 )
 
         if not students:
@@ -904,6 +1301,17 @@ class StudentRegistry:
         self._create_backup(self.csv_path)
         return replace(schema, has_active=True, fieldnames=schema.fieldnames + ("Aktiv",))
 
+    def _ensure_birth_date_schema(self, schema: _CsvSchema, *, required: bool) -> _CsvSchema:
+        if schema.has_birth_date or not required:
+            return schema
+        # Adding Geburtsdatum is a schema migration as well.
+        self._create_backup(self.csv_path)
+        return replace(
+            schema,
+            has_birth_date=True,
+            fieldnames=schema.fieldnames + (BIRTH_DATE_HEADER,),
+        )
+
     def _write_students(
         self,
         students: Sequence[Student],
@@ -933,6 +1341,8 @@ class StudentRegistry:
                     row[name] = student.first_name
             if schema.has_active:
                 row["Aktiv"] = "1" if student.active else "0"
+            if schema.has_birth_date:
+                row[BIRTH_DATE_HEADER] = format_birth_date(student.birth_date)
             writer.writerow(row)
         encoded = output.getvalue().encode(schema.encoding)
         self.checked_fingerprint()
@@ -960,6 +1370,11 @@ class StudentRegistry:
                 raise RegistryValidationError(
                     "Der Aktiv-Status muss wahr oder falsch sein."
                 )
+            if student.birth_date is not None and (
+                not isinstance(student.birth_date, date)
+                or isinstance(student.birth_date, datetime)
+            ):
+                raise RegistryValidationError("Das Geburtsdatum muss ein Datum sein.")
 
     def _write_aliases(self, aliases: Mapping[str, _Alias]) -> None:
         payload = {
@@ -1062,7 +1477,10 @@ class StudentRegistry:
 
 
 __all__ = [
+    "BIRTH_DATE_HEADER",
     "MatchStatus",
+    "NameEvidence",
+    "NewStudentProposal",
     "RegistryUnavailableError",
     "RegistryValidationError",
     "RegistryWriteError",
@@ -1072,5 +1490,7 @@ __all__ = [
     "StudentRegistry",
     "StudentRegistryError",
     "StudentSuggestion",
+    "format_birth_date",
     "normalize_name",
+    "parse_birth_date_cell",
 ]

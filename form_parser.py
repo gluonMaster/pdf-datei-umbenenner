@@ -8,6 +8,7 @@ import re
 import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from name_matching import latinize as _latinize
 from page_data import ExtractionSource, PageData, PageWord
 from text_parser import TextParser
 
@@ -177,19 +178,8 @@ class FormParseResult:
         return self.student_name, self.subject
 
 
-# Cyrillic letters that scanner OCR produced inside German words.
-_LATIN_LOOKALIKES = str.maketrans({
-    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
-    "Р": "P", "С": "C", "Т": "T", "Х": "X", "У": "Y", "І": "I", "Ј": "J",
-    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
-    "к": "k", "т": "t", "і": "i", "ј": "j", "ı": "i",
-})
 _CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 _LATIN = re.compile(r"[A-Za-z]")
-
-
-def _latinize(value: str) -> str:
-    return value.translate(_LATIN_LOOKALIKES)
 
 
 def _latinize_mixed(token: str) -> str:

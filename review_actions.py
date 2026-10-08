@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -51,6 +52,7 @@ class ReviewActionResult:
     subject_alias_saved: bool = False
     file_moved: bool = False
     queue_removed: bool = False
+    birth_date_saved: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -133,6 +135,8 @@ class ReviewActionService:
                     student_alias_saved = True
             elif decision != ReviewDecision.RENAME_ONLY:
                 raise ValueError(f"Unbekannte Prüfaktion: {decision}")
+
+            birth_date_saved = self._learn_birth_date(student, request.item)
 
             raw_subject = (request.item.raw_subject or "").strip()
             if raw_subject and raw_subject != subject:
@@ -232,7 +236,8 @@ class ReviewActionService:
 
             return ReviewActionResult(
                 ReviewActionStatus.SUCCESS,
-                f"PDF wurde als {target_path.name} gespeichert.",
+                f"PDF wurde als {target_path.name} gespeichert."
+                + (" Geburtsdatum übernommen." if birth_date_saved else ""),
                 target_path,
                 student,
                 registry_saved,
@@ -240,6 +245,7 @@ class ReviewActionService:
                 subject_alias_saved,
                 file_moved=True,
                 queue_removed=True,
+                birth_date_saved=birth_date_saved,
             )
         except Exception as error:
             persistent_change = (
@@ -266,6 +272,34 @@ class ReviewActionService:
                 file_moved,
                 False,
             )
+
+    def _learn_birth_date(self, student: Optional[Student], item: ReviewItem) -> bool:
+        """Store the document's birth date for an operator-confirmed student.
+
+        Only a cleanly read date (no contradicting readings) is used, and an
+        already stored date is never replaced. Failures do not stop the action.
+        """
+
+        learn = getattr(self.student_registry, "learn_birth_date", None)
+        birth_date = self._item_birth_date(item)
+        if student is None or birth_date is None or not callable(learn):
+            return False
+        try:
+            return learn(student.number, birth_date) == "stored"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _item_birth_date(item: ReviewItem) -> Optional[date]:
+        if not item.birth_date:
+            return None
+        for evidence in item.field_evidence:
+            if evidence.get("field") == "birth_date" and evidence.get("uncertainties"):
+                return None
+        try:
+            return date.fromisoformat(item.birth_date)
+        except (TypeError, ValueError):
+            return None
 
     def _find_or_add_student(self, last_name: str, first_name: str) -> tuple[Student, bool]:
         requested_key = (normalize_name(last_name), normalize_name(first_name))

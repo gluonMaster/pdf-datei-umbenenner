@@ -178,9 +178,11 @@ def test_unknown_student_is_confirmed_once_then_next_document_is_automatic(tmp_p
 
 
 def test_ocr_name_correction_alias_makes_next_document_automatic(tmp_path):
+    # "x" for "o" is not a typical OCR confusion, so this spelling is not
+    # corrected automatically and goes through review and alias learning.
     service, registry, review_store, actions = _stack(
         tmp_path,
-        "Dae Jane",
+        "Dxe Jane",
         ((7, "Doe", "Jane"),),
     )
     item = _first_document_to_review(
@@ -208,7 +210,7 @@ def test_ocr_name_correction_alias_makes_next_document_automatic(tmp_path):
     assert resolved.student_alias_saved
     assert not resolved.registry_saved
     assert review_store.count() == 0
-    assert registry.match("Dae Jane").status == MatchStatus.EXACT
+    assert registry.match("Dxe Jane").status == MatchStatus.EXACT
 
     repeated_source = tmp_path / "second.pdf"
     repeated_source.write_bytes(b"second PDF")
@@ -220,7 +222,7 @@ def test_ocr_name_correction_alias_makes_next_document_automatic(tmp_path):
     assert repeated.planned_name == "Doe_Jane_Mathematik_November_2050_1.pdf"
     assert repeated.planned_path.read_bytes() == b"second PDF"
     reloaded = StudentRegistry(registry.csv_path, registry.aliases_path)
-    assert reloaded.match("Dae Jane").status == MatchStatus.EXACT
+    assert reloaded.match("Dxe Jane").status == MatchStatus.EXACT
 
 
 def test_dry_run_preserves_real_registry_alias_queue_and_pdf_files(tmp_path):
@@ -356,3 +358,25 @@ def test_native_move_diagnostic_reaches_manual_review_result(tmp_path, monkeypat
     assert "Zugriff auf Ziel verweigert" in result.message
     assert queue.count() == 1
     assert (tmp_path / item.file_path).read_bytes() == b"first PDF"
+
+
+def test_typical_ocr_error_is_corrected_without_learning_an_alias(tmp_path):
+    service, registry, review_store, _actions = _stack(
+        tmp_path,
+        "Dae Jane",
+        ((7, "Doe", "Jane"), (8, "Other", "Person")),
+    )
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"scan")
+    csv_before = registry.csv_path.read_bytes()
+
+    result = service.process_batch([source], 5, 2051).results[0]
+
+    assert result.student_match.status == MatchStatus.AUTO_CORRECTED
+    assert result.student_match.student.number == 7
+    assert result.performed_action == PerformedAction.RENAMED
+    assert result.planned_name == "Doe_Jane_Mathematik_Mai_2051.pdf"
+    assert any("automatisch korrigiert" in warning for warning in result.warnings)
+    assert registry.csv_path.read_bytes() == csv_before
+    assert not registry.aliases_path.exists()
+    assert review_store.count() == 0
