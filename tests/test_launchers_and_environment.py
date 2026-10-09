@@ -278,6 +278,13 @@ def test_batch_files_are_ascii_and_use_the_local_environment():
     assert "winget" not in setup
     assert "requirements-ocr" not in setup + smart
     assert '"%venv_python%" -m pip install' in smart
+    # Wheels only: no source build attempt on PCs without a compiler.
+    assert setup.count("--only-binary=:all:") == 2 and smart.count("--only-binary=:all:") == 1
+    # Python is installed only after an explicit yes, PATH stays unchanged.
+    assert setup.index('call :ask_yes_no "python jetzt herunterladen') < setup.index(
+        '-file "%project_dir%install_python.ps1"'
+    )
+    assert "--unattended" in setup and "set \"pause_at_end=0\"" in setup
     assert "requirements-current" in smart
     assert "--health-only" in smart
     assert smart.index("requirements-current") < smart.index(":repair_environment")
@@ -293,7 +300,20 @@ def test_quick_start_never_installs_or_repairs_packages():
     assert " pip " not in quick
     assert "requirements" not in quick
     assert "setup.bat" not in quick
-    assert '"%venv_python%" "%project_dir%start_gui.py"' in quick
+    # Own GUI process without a console (pythonw.exe) instead of waiting.
+    assert 'start "" "%gui_python%" "%project_dir%start_gui.py"' in quick
+    assert 'set "gui_python=%venv_pythonw%"' in quick
+
+
+def test_python_installer_script_is_pinned_and_verifies_before_running():
+    script = (PROJECT_ROOT / "install_python.ps1").read_text(encoding="utf-8")
+
+    assert "https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe" in script
+    assert script.index("Get-AuthenticodeSignature") < script.index("Start-Process")
+    assert "CN=`\"?Python Software Foundation" in script
+    for option in ("InstallAllUsers=0", "PrependPath=0", "Include_launcher=0", "Include_tcltk=1"):
+        assert f'"{option}"' in script
+    assert "Invoke-Expression" not in script
 
 
 def test_dependency_groups_are_separate():

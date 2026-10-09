@@ -3,31 +3,55 @@ setlocal EnableExtensions DisableDelayedExpansion
 title PDF Datei Umbenenner - Smart Launcher
 
 set "PROJECT_DIR=%~dp0"
+set "SCRIPT_NAME=%~nx0"
 set "VENV_PYTHON=%~dp0.venv\Scripts\python.exe"
+set "VENV_PYTHONW=%~dp0.venv\Scripts\pythonw.exe"
 set "LOG_DIR=%~dp0.launcher-logs"
 set "LOG_FILE=%~dp0.launcher-logs\start_app.log"
 set "PYTHONIOENCODING=utf-8"
 set "PYTHON_MANAGER_AUTOMATIC_INSTALL=false"
+rem Python installed by setup.bat on request (see install_python.ps1).
+set "PINNED_PYTHON_TAG=3.14"
+set "PINNED_PYTHON_DIR=%LOCALAPPDATA%\Programs\Python\Python314"
 set "REINSTALL_FLAGS="
+set "HEALTH_ONLY=0"
+set "PAUSE_ON_ERROR=auto"
 
-if not "%~2"=="" exit /b 64
+:parse_arguments
 if "%~1"=="" goto arguments_done
-if /i "%~1"=="--health-only" goto arguments_done
-echo FEHLER: Erlaubter Parameter: --health-only
+if /i "%~1"=="--health-only" goto select_health_only
+if /i "%~1"=="--no-pause" goto select_no_pause
+echo FEHLER: Erlaubte Parameter: --health-only, --no-pause
 exit /b 64
 
+:select_health_only
+set "HEALTH_ONLY=1"
+shift
+goto parse_arguments
+
+:select_no_pause
+set "PAUSE_ON_ERROR=0"
+shift
+goto parse_arguments
+
 :arguments_done
+if "%PAUSE_ON_ERROR%"=="auto" call :detect_double_click
+
+rem cmd.exe cannot use a UNC path as the current directory.
+if "%PROJECT_DIR:~0,2%"=="\\" goto unc_location
 
 cd /d "%PROJECT_DIR%"
 if errorlevel 1 (
     echo FEHLER: Das Anwendungsverzeichnis kann nicht geoeffnet werden.
-    exit /b 50
+    set "FAIL_CODE=50"
+    goto finish_failure
 )
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
 if not exist "%LOG_DIR%" (
     echo FEHLER: Diagnoseverzeichnis kann nicht erstellt werden: "%LOG_DIR%"
-    exit /b 50
+    set "FAIL_CODE=50"
+    goto finish_failure
 )
 
 >"%LOG_FILE%" echo PDF Datei Umbenenner launcher diagnostics
@@ -116,6 +140,7 @@ goto environment_ready
 set "FAIL_CODE=%ERRORLEVEL%"
 if "%FAIL_CODE%"=="34" goto pymupdf_runtime_failed
 echo FEHLER: Die lokale Umgebung konnte nicht repariert werden.
+if "%FAIL_CODE%"=="10" echo Python fehlt: setup.bat ausfuehren, es installiert Python auf Wunsch.
 goto launcher_failure
 
 :environment_ready
@@ -132,7 +157,7 @@ goto launch_application
 echo OK: Tesseract OCR mit deutschen Sprachdaten ist bereit.
 
 :launch_application
-if /i "%~1"=="--health-only" (
+if "%HEALTH_ONLY%"=="1" (
     echo Reine Zustandspruefung abgeschlossen. Die GUI wurde nicht gestartet.
     exit /b 0
 )
@@ -143,22 +168,42 @@ if not exist "%PROJECT_DIR%start_gui.py" (
     goto launcher_failure
 )
 
+rem The GUI runs as its own process without a console, so this window closes
+rem now; start errors go to .launcher-logs\gui.log and a message box.
 echo Anwendung wird gestartet...
-"%VENV_PYTHON%" "%PROJECT_DIR%start_gui.py" >>"%LOG_FILE%" 2>&1
-set "APP_EXIT_CODE=%ERRORLEVEL%"
-if not "%APP_EXIT_CODE%"=="0" goto application_failure
-
-echo Anwendung wurde normal beendet.
+set "GUI_PYTHON=%VENV_PYTHONW%"
+if not exist "%GUI_PYTHON%" set "GUI_PYTHON=%VENV_PYTHON%"
+rem start keeps an earlier ERRORLEVEL on success; reset it first.
+(call )
+start "" "%GUI_PYTHON%" "%PROJECT_DIR%start_gui.py" <nul >nul 2>&1
+if errorlevel 1 goto application_start_failed
+>>"%LOG_FILE%" echo GUI process started: "%GUI_PYTHON%"
 exit /b 0
 
-:application_failure
-set "FAIL_CODE=%APP_EXIT_CODE%"
-echo FEHLER: Die Anwendung wurde mit Code %FAIL_CODE% beendet.
+:application_start_failed
+set "FAIL_CODE=50"
+echo FEHLER: Die Anwendung konnte nicht gestartet werden.
 goto launcher_failure
+
+:unc_location
+echo FEHLER: Das Programm liegt auf einem Netzwerkpfad:
+echo   "%PROJECT_DIR%"
+echo Von dort kann es nicht gestartet werden. Bitte den Programmordner auf diesen
+echo Computer kopieren, zum Beispiel nach "%USERPROFILE%\PDF-Datei-Umbenenner",
+echo und dort setup.bat ausfuehren.
+set "FAIL_CODE=51"
+goto finish_failure
 
 :launcher_failure
 if not defined FAIL_CODE set "FAIL_CODE=1"
 echo Diagnoselog: "%LOG_FILE%"
+
+:finish_failure
+if "%PAUSE_ON_ERROR%"=="1" (
+    echo.
+    echo Zum Schliessen dieses Fensters eine beliebige Taste druecken...
+    pause >nul
+)
 exit /b %FAIL_CODE%
 
 :repair_core
@@ -179,7 +224,7 @@ goto repair_install_core
 if not exist "%VENV_PYTHON%" exit /b 50
 "%VENV_PYTHON%" -m ensurepip --upgrade >>"%LOG_FILE%" 2>&1
 if errorlevel 1 exit /b %ERRORLEVEL%
-"%VENV_PYTHON%" -m pip install --disable-pip-version-check %REINSTALL_FLAGS% -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
+"%VENV_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: %REINSTALL_FLAGS% -r "%PROJECT_DIR%requirements.txt" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%VENV_PYTHON%" "%PROJECT_DIR%bootstrap.py" check-core >>"%LOG_FILE%" 2>&1
 if "%ERRORLEVEL%"=="20" goto repair_imports_retry
@@ -198,23 +243,49 @@ goto repair_install_core
 if errorlevel 1 exit /b %ERRORLEVEL%
 exit /b 0
 
+:detect_double_click
+rem Explorer and shortcuts run cmd.exe /c with this script; that window closes
+rem on exit. A console the user opened has no script name in its command line.
+set "PAUSE_ON_ERROR=0"
+setlocal EnableDelayedExpansion
+set "LAUNCH_LINE=!CMDCMDLINE!"
+set "LAUNCH_LINE_WITHOUT_SCRIPT=!LAUNCH_LINE:%SCRIPT_NAME%=!"
+if /i "!LAUNCH_LINE_WITHOUT_SCRIPT!"=="!LAUNCH_LINE!" (
+    endlocal
+    exit /b 0
+)
+endlocal
+set "PAUSE_ON_ERROR=1"
+exit /b 0
+
 :find_supported_python
-echo Suche Python 3.10 oder neuer. Falls es fehlt: setup.bat starten.
+echo Suche Python 3.10 bis 3.15. Falls es fehlt: setup.bat starten.
+rem Same order as setup.bat; a Microsoft Store placeholder never counts.
 set "BASE_PYTHON="
 set "BASE_PYTHON_ARGS="
 where py >nul 2>&1
+if errorlevel 1 goto launcher_find_pinned_directory
+call :launcher_accept_python py -%PINNED_PYTHON_TAG%
+if not errorlevel 1 exit /b 0
+:launcher_find_pinned_directory
+if not exist "%PINNED_PYTHON_DIR%\python.exe" goto launcher_find_default_py
+call :launcher_accept_python "%PINNED_PYTHON_DIR%\python.exe"
+if not errorlevel 1 exit /b 0
+:launcher_find_default_py
+where py >nul 2>&1
 if errorlevel 1 goto launcher_try_python
-py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 10)" >nul 2>&1
-if errorlevel 1 goto launcher_try_python
-set "BASE_PYTHON=py"
-set "BASE_PYTHON_ARGS=-3"
-exit /b 0
-
+call :launcher_accept_python py -3
+if not errorlevel 1 exit /b 0
 :launcher_try_python
 where python >nul 2>&1
 if errorlevel 1 exit /b 10
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 10)" >nul 2>&1
-if errorlevel 1 exit /b 10
-set "BASE_PYTHON=python"
-set "BASE_PYTHON_ARGS="
+call :launcher_accept_python python
+if not errorlevel 1 exit /b 0
+exit /b 10
+
+:launcher_accept_python
+"%~1" %2 -c "import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 15) else 11)" >nul 2>&1
+if not "%ERRORLEVEL%"=="0" exit /b 1
+set "BASE_PYTHON=%~1"
+set "BASE_PYTHON_ARGS=%2"
 exit /b 0

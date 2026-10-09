@@ -15,6 +15,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from alias_manager import AliasManager
+from desktop_integration import (
+    MAIN_WINDOW_TITLE,
+    apply_window_icon,
+    initial_window_geometry,
+    screen_work_area,
+    set_app_user_model_id,
+    show_message,
+)
 from file_opener import FileOpener
 from file_renamer import FileRenamer
 from form_parser import FormParser
@@ -55,9 +63,15 @@ class PDFRenamerGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("PDF Datei Umbenenner - Automatisches Umbenennen")
-        self.root.geometry("1200x760")
+        self.root.title(MAIN_WINDOW_TITLE)
+        geometry, maximize = initial_window_geometry(screen_work_area(self.root))
+        self.root.geometry(geometry)
+        if maximize:
+            self.root.state("zoomed")
+        # Small screens (1366x768, 1920x1080 at 150 %) need every pixel.
+        self.compact_layout = maximize
         self.root.resizable(True, True)
+        apply_window_icon(self.root, Path(__file__).parent)
 
         now = datetime.now()
         self.selected_folder = tk.StringVar()
@@ -131,9 +145,10 @@ class PDFRenamerGUI:
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=1)
 
-        ttk.Label(
-            main_frame, text="PDF Datei Umbenenner", font=("Arial", 16, "bold")
-        ).grid(row=0, column=0, pady=(0, 15))
+        if not getattr(self, "compact_layout", False):
+            ttk.Label(
+                main_frame, text="PDF Datei Umbenenner", font=("Arial", 16, "bold")
+            ).grid(row=0, column=0, pady=(0, 15))
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.setup_processing_tab()
@@ -333,15 +348,21 @@ class PDFRenamerGUI:
         )
         self.student_search_entry = ttk.Entry(right, textvariable=self.student_query)
         self.student_search_entry.grid(row=11, column=0, columnspan=2, sticky=(tk.W, tk.E))
+        # The only stretchable row: on low screens the result list gives up
+        # height so that the buttons below stay visible; on large ones it grows.
+        right.rowconfigure(12, weight=1)
         results = ttk.Frame(right)
-        results.grid(row=12, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(2, 0))
+        results.grid(
+            row=12, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(2, 0)
+        )
         results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
         self.student_listbox = tk.Listbox(
             results, height=4, exportselection=False, activestyle="dotbox"
         )
         listbox_scroll = ttk.Scrollbar(results, command=self.student_listbox.yview)
         self.student_listbox.config(yscrollcommand=listbox_scroll.set)
-        self.student_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self.student_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         listbox_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.student_search_hint = ttk.Label(right, text="", foreground="gray")
         self.student_search_hint.grid(row=13, column=0, columnspan=2, sticky=tk.W)
@@ -1730,17 +1751,22 @@ class PDFRenamerGUI:
 
 
 def main():
+    set_app_user_model_id()
     try:
         PDFRenamerGUI().run()
     except Exception as error:
-        # start_app.bat redirects stderr to its diagnostic log.
+        # Without a console start_gui.py redirects stderr to gui.log.
         import traceback
 
         traceback.print_exc()
-        messagebox.showerror(
-            "Kritischer Fehler",
-            f"Die Anwendung konnte nicht gestartet werden:\n{error}",
-        )
+        text = f"Die Anwendung konnte nicht gestartet werden:\n{error}"
+        log_name = str(getattr(sys.stderr, "name", ""))
+        if log_name.endswith("gui.log"):
+            text += f"\n\nDetails: {log_name}"
+        try:
+            messagebox.showerror("Kritischer Fehler", text)
+        except Exception:  # Tk itself may be what failed.
+            show_message("Kritischer Fehler", text, error=True)
         sys.exit(1)
 
 
