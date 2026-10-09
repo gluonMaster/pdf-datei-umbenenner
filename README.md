@@ -1,433 +1,164 @@
-# PDF Datei Umbenenner
+<p align="center">
+  <img src="docs/images/icon.png" width="96" alt="PDF Datei Umbenenner icon">
+</p>
 
-Приложение переименовывает школьные PDF-формуляры по каноническому имени ученика, предмету и явно выбранным месяцу и году. Основной интерфейс написан на Tkinter; CLI использует тот же сервис обработки.
+<h1 align="center">PDF Datei Umbenenner</h1>
 
-## Что поддерживается
+<p align="center">
+  Automatic renaming of scanned attendance forms by student, subject and month —<br>
+  local OCR, matching against your own student registry and a fast review workflow for Windows offices.
+</p>
 
-- старый формуляр с именем и предметом в верхней части страницы;
-- новый `Anwesenheitsnachweis` (с колонкой `GR/EZ` и без неё), где имя находится над `Name des Schülers`, дата рождения - над `Geburtsdatum`, а предмет - в столбце `Fach`;
-- подписи формуляра и предметы находятся и при типичных ошибках OCR (до четверти букв; короткие подписи вроде `Ort` - только точно), значения колонки `GR/EZ` не принимаются за предмет;
-- OCR первой страницы каждого документа (Tesseract) с текстовым слоем PDF как вторым чтением;
-- ручное подтверждение неизвестного ученика и запоминание OCR-варианта как алиаса;
-- безопасный импорт и редактирование `Schuler.csv`;
-- коллизии имён на диске и внутри одного пакетного запуска.
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6" alt="Platform: Windows 10 | 11">
+  <img src="https://img.shields.io/badge/python-3.10%E2%80%933.15-3776AB" alt="Python 3.10–3.15">
+  <img src="https://img.shields.io/badge/OCR-Tesseract%205%20(deu)-5E8A3E" alt="OCR: Tesseract 5">
+  <img src="https://img.shields.io/badge/tests-pytest-0A9EDC" alt="Tests: pytest">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT">
+</p>
 
-Тип формуляра определяется по структуре и надписям страницы, а не по исходному имени PDF. Данные преподавателя используются только как структурная граница формуляра и никогда не входят в итоговое имя. `Lehrer.csv` в переименовании не участвует.
+<p align="center">
+  <b>English</b> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
+</p>
 
-## Итоговое имя файла
+![Walkthrough: a folder of scans is processed, two documents are resolved in the review tab](docs/images/demo.gif)
 
-Формат всегда один:
+## Why
 
-```text
-Nachname_Vorname_Fach_Monat_Jahr.pdf
-```
-
-Обезличенный пример:
-
-```text
-Beispiel_Lena_Mathematik_April_2028.pdf
-```
-
-Месяц записывается по-немецки. Месяц и год берутся только из значений, выбранных перед запуском пакета в GUI, либо из обязательных параметров CLI. При открытии GUI показан текущий период, который можно изменить. Даты внутри формуляра и последующие изменения системной даты не подменяют выбранный период.
-
-При коллизии выбирается первый свободный суффикс без перезаписи существующих файлов:
+Tutoring providers that work with job centres receive a signed attendance form for every student, subject and month. The scanner saves them as `Scan_0001.pdf`, `Scan_0002.pdf`, … and someone has to open each file, read the name and the subject and rename it before it can be filed or invoiced. PDF Datei Umbenenner does this automatically:
 
 ```text
-Beispiel_Lena_Mathematik_April_2028.pdf
-Beispiel_Lena_Mathematik_April_2028_1.pdf
-Beispiel_Lena_Mathematik_April_2028_2.pdf
+Scan_2026-09-30_0001.pdf  →  Beispiel_Lena_Mathematik_September_2026.pdf
+Scan_2026-09-30_0002.pdf  →  Muster_Max_Deutsch_September_2026.pdf
+Scan_2026-09-30_0006.pdf  →  review: new student "Hoffmann Sophie" (birth date prefilled)
 ```
 
-## Установка и запуск в Windows
+When the program is not certain, it never guesses: the document goes to a review queue with a prepared proposal, and the operator confirms it with one click.
 
-Требуется Python 3.10–3.15 с `tkinter`; если его нет, интерактивный setup после согласия устанавливает Python 3.14 сам (см. ниже). Для обработки PDF дополнительно нужен Tesseract OCR с немецкими языковыми данными `deu` — отдельная системная программа. Без него приложение запускается, справочник учеников и очередь `Prüfung` работают, но обработка, в том числе пробный прогон, заблокирована.
+## Features
 
-`Schuler.csv` не входит в репозиторий: положите его в каталог приложения до запуска setup, иначе проверка завершится кодом `24`.
+- **Two form layouts.** The attendance record *Anwesenheitsnachweis* (with or without a *GR/EZ* column) and an older layout with a "Nachname Vorname Fach" header line. The layout is recognised from the page content, never from the file name.
+- **Robust reading of real scans.** Every page is read with Tesseract OCR; the scanner's text layer serves as an independent second reading. Labels are found despite typical OCR errors, sideways and upside-down scans are turned upright, and *GR/EZ* entries are never mistaken for the subject.
+- **Careful student identification.** Names are matched against a closed list (`Schuler.csv`) with an optional birth date as an extra key. Typical OCR confusions (`i/l/1`, `rn/m`, `o/a` …) are corrected only under a strict rule; similar or new students always go to review.
+- **One-click review.** The *Prüfung* tab shows the scan fragments of name, birth date and subject next to the form, a live student search and prepared decisions: take the suggested student, create a new student with the recognised data, or adopt a new subject.
+- **Registry management.** Edit, deactivate and deduplicate students, manage aliases, import CSV files with a preview of every change and automatic backups.
+- **Safe file handling.** Dry-run mode, atomic writes, no overwriting (`_1`, `_2` suffixes), rollback on partial failures, nothing is deleted.
+- **Ready for office PCs.** `setup.bat` installs Python on request (signature-checked), checks Tesseract, creates shortcuts with the app icon and explains every error in plain German. The app starts without a console window and runs only once per installation.
+- **Private by design.** Everything runs locally. No cloud OCR, no telemetry; registries, scans and the review queue never leave the computer.
 
-### Перед установкой: куда распаковать
+## Screenshots
 
-1. Скачанный ZIP **до распаковки** разблокируйте: правый щелчок → `Eigenschaften` → внизу отметить `Zulassen` (`Unblock`) → `OK`. Иначе Windows помечает все файлы как «из интернета» и при каждом запуске BAT показывает предупреждение безопасности. Setup снимает эту пометку с файлов программы и сам (`*.bat`, `*.ps1`, `*.py`, иконка, `*.txt`, `*.md` в корне программы; `.venv`, CSV, JSON и сканы не трогаются), но первый запуск `setup.bat` из помеченного архива всё равно спросит подтверждение.
-2. Рекомендуемое место — локальная папка пользователя, например `C:\Users\<Имя>\PDF-Datei-Umbenenner` (`%USERPROFILE%\PDF-Datei-Umbenenner`).
-3. Не используйте сетевой путь (`\\server\share\...`): cmd не может сделать его текущим каталогом, лаунчеры сразу завершаются кодом `51` с советом скопировать программу на компьютер.
-4. Не используйте папки OneDrive (в том числе рабочий стол, перенаправленный в OneDrive): синхронизация тысяч файлов `.venv` приводит к блокировкам и сбоям `pip`. Setup распознаёт расположение внутри `%OneDrive%`, `%OneDriveCommercial%` или `%OneDriveConsumer%`, предупреждает и спрашивает, продолжать ли (отказ — код `52`, ничего не устанавливается; в `--unattended` — только предупреждение).
+| Processing a folder | Review: new student |
+| --- | --- |
+| [![Processing tab after a batch](docs/images/processing.png)](docs/images/processing.png) | [![Review tab with a new student proposal](docs/images/review-new-student.png)](docs/images/review-new-student.png) |
+| **Review: new subject for a known student** | **Student registry** |
+| [![Review tab with a new subject proposal](docs/images/review-new-subject.png)](docs/images/review-new-subject.png) | [![Student registry tab](docs/images/students.png)](docs/images/students.png) |
 
-### Установка Tesseract
+All screenshots use the fictional demo data from [`demo/`](demo/).
 
-Официальная [документация Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) для Windows ссылается на установщик UB Mannheim:
+## How it works
 
-1. откройте [страницу UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) и скачайте актуальный 64-битный `tesseract-ocr-w64-setup-….exe`;
-2. запустите установщик и оставьте предложенный каталог;
-3. в выборе компонентов в разделе `Additional language data` отметьте `German`; `eng` и `osd` входят в стандартную установку;
-4. если Tesseract уже установлен без `deu`, запустите установщик повторно и добавьте `German` либо скопируйте `deu.traineddata` из [tessdata](https://github.com/tesseract-ocr/tessdata) в папку `tessdata` рядом с `tesseract.exe`.
+```mermaid
+flowchart LR
+    A[Scanned PDF] --> B[Render page<br>PyMuPDF]
+    B --> C[OCR<br>Tesseract deu]
+    A --> D[Text layer<br>second reading]
+    C --> E[Detect form layout]
+    D --> E
+    E --> F[Read name, birth date<br>and subject]
+    F --> G[Identify student<br>Schuler.csv]
+    G -->|certain| H[Rename<br>Nachname_Vorname_Fach_Monat_Jahr.pdf]
+    G -->|uncertain| I[Review queue<br>manual_check]
+    I --> J[Prüfung tab<br>one-click decision]
+    J --> H
+```
 
-Приложение ищет `tesseract.exe` в `TESSERACT_CMD`, `PATH`, `%ProgramFiles%\Tesseract-OCR`, `%ProgramFiles(x86)%\Tesseract-OCR`, `%LOCALAPPDATA%\Programs\Tesseract-OCR` (установка только для текущего пользователя) и `%LOCALAPPDATA%\Tesseract-OCR`. Для другого каталога задайте `TESSERACT_CMD` с полным путём к `tesseract.exe`. Данные `osd` необязательны: без них хуже распознаются повёрнутые набок сканы, проверка выдаёт только предупреждение.
+Month and year always come from the operator's selection, never from dates on the form. Details: [How recognition works](docs/en/how-it-works.md).
 
-### Первичная установка
+**Measured on real scans.** On 17 real scans from daily operation (not published), the current version makes 12 correct automatic decisions, **0 wrong ones**, and sends 5 documents to review — all justified, because 4 students were not yet in the registry. After adding them, 17 of 17 documents are renamed automatically. Processing takes about 2–3 seconds per document. The sample is small, so treat these numbers as an indication rather than a guarantee.
+
+## Quick start
+
+1. Download the repository as a ZIP file, **unblock it** (*Properties → Unblock*) and extract it to a local folder such as `C:\Users\<Name>\PDF-Datei-Umbenenner` — not into OneDrive and not onto a network drive.
+2. Install [Tesseract OCR](docs/en/installation.md#2-install-tesseract-ocr) with the German language data.
+3. Copy your student registry `Schuler.csv` into the program folder (format: `Nummer;Nachname;Vorname[;Geburtsdatum]`).
+4. Double-click `setup.bat`. It installs Python if necessary (after asking), sets up a private environment and offers desktop and Start menu shortcuts.
+5. Start **PDF Datei Umbenenner** from the shortcut, choose the folder with the scans, the month and the year, and click *Verarbeitung starten*.
+
+Full guide: [Installation and operation](docs/en/installation.md) · [User guide](docs/en/user-guide.md)
+
+## Try the demo
+
+The [`demo/`](demo/) folder contains seven fictional scans and a matching student registry. After `setup.bat` has run:
 
 ```cmd
-setup.bat
+.venv\Scripts\python.exe demo\run_demo.py
 ```
 
-Обычно setup запускают двойным щелчком. Интерактивный setup:
+```text
+Scan_2026-09-30_0001.pdf  -> Beispiel_Lena_Mathematik_September_2026.pdf
+Scan_2026-09-30_0002.pdf  -> Muster_Max_Deutsch_September_2026.pdf
+Scan_2026-09-30_0003.pdf  -> Schneider_Jonas_Englisch_September_2026.pdf
+Scan_2026-09-30_0004.pdf  -> Weber_Mia_Biologie_September_2026.pdf
+Scan_2026-09-30_0005.pdf  -> Probe_Paula_Physik_September_2026.pdf
+Scan_2026-09-30_0006.pdf  -> Prüfung: Kein passender Schüler im Verzeichnis gefunden; vermutlich ein neuer Schüler. …
+Scan_2026-09-30_0007.pdf  -> Prüfung: Unbekannte Fachwerte im Tabellenfeld: Latein; …
+```
 
-1. находит Python (см. «Если Python отсутствует») и создаёт локальное `.venv` (права администратора не нужны);
-2. устанавливает `requirements.txt` (`pdfplumber`, `PyMuPDF`, `Pillow`) только из готовых колёс (`--only-binary=:all:`: сборка из исходников на рабочих ПК без компилятора всё равно не удалась бы) и проверяет пакеты, импорт приложения, `subjects_config.json` и `Schuler.csv`; повреждённые пакеты один раз переустанавливаются без кэша;
-3. только после успешной проверки записывает штамп `.venv\.requirements.sha256`;
-4. проверяет Tesseract и языки `deu`/`eng`. Если их нет, показывает немецкую инструкцию и после явного согласия открывает официальную страницу загрузки. Устанавливаете Tesseract вы сами; после нажатия Enter setup проверяет его повторно. Если Tesseract так и не готов, setup завершается кодом `31`, `32` или `33` и сообщением `SETUP UNVOLLSTAENDIG: VERARBEITUNG NICHT VERFUEGBAR`;
-5. предлагает создать ярлыки (рабочий стол и меню «Пуск») и запустить приложение;
-6. в конце всегда ждёт нажатия клавиши, если запущен двойным щелчком или ярлыком, чтобы итог и ошибки можно было прочитать. Из открытой консоли setup не ждёт; `--no-pause` и `--unattended` отключают ожидание и в остальных случаях.
+The script works on a copy in `demo\output`; the demo files and your own registry stay unchanged. `--dry-run` only plans the names.
 
-Setup не запускает установщик Tesseract сам: официальная документация описывает только ручную установку, а подпись этого установщика нельзя проверить так, как пакет Microsoft.
+| Attendance record (*Anwesenheitsnachweis*) | Older layout |
+| --- | --- |
+| <img src="docs/images/form-attendance.png" width="360" alt="Fictional attendance form"> | <img src="docs/images/form-legacy.png" width="360" alt="Fictional older form"> |
 
-При ошибке DLL PyMuPDF (`34`) пакеты сначала один раз переустанавливаются. Если не помогло, интерактивный setup отдельно спрашивает разрешение установить Microsoft VC++ Runtime. Установщик проверяет цифровую подпись Microsoft и требует консоль, запущенную от администратора; повышение прав не запрашивается. Отказ или ошибка — код `34`.
+## Documentation
 
-Режимы без вопросов:
+| Topic | English | Deutsch | Русский |
+| --- | --- | --- | --- |
+| Installation, start, updates, exit codes | [installation](docs/en/installation.md) | [Installation](docs/de/installation.md) | [установка](docs/ru/installation.md) |
+| Daily work: processing, review, registry | [user guide](docs/en/user-guide.md) | [Benutzerhandbuch](docs/de/user-guide.md) | [руководство](docs/ru/user-guide.md) |
+| Recognition, identification rules, data safety | [how it works](docs/en/how-it-works.md) | [Funktionsweise](docs/de/how-it-works.md) | [как это работает](docs/ru/how-it-works.md) |
+| CLI, API, tests, measurement stand | [development](docs/en/development.md) | [Entwicklung](docs/de/development.md) | [разработка](docs/ru/development.md) |
+
+The program's interface and messages are in German, as it is used in German offices.
+
+## Privacy
+
+The program processes personal data of students (names, birth dates). It is designed to keep that data on the computer where it is processed:
+
+- OCR runs locally with Tesseract; no file is uploaded anywhere. Internet access is only needed while installing.
+- The registry (`Schuler.csv`, `Lehrer.csv`), learned aliases, the review queue and all scans are excluded from Git by [`.gitignore`](.gitignore).
+- Tests, documentation and the demo use invented names only. Please never attach real scans or registries to issues.
+
+## Project structure
+
+```text
+gui_main.py, start_gui.py        Tkinter interface and its launcher entry point
+processing_service.py            one processing pipeline for GUI and CLI
+pdf_extractor.py, ocr.py         page rendering, Tesseract OCR, text layer
+form_parser.py, text_parser.py   form detection and field reading
+name_matching.py                 OCR-aware name comparison
+student_registry*.py             registry, aliases, identification, CSV import
+review_*.py                      review queue, actions, scan fragments
+file_renamer.py, validator.py    safe renaming and subject validation
+desktop_integration.py           single instance, icon, window size (Windows)
+setup.bat, start_app.bat, …      installation and launchers, bootstrap.py checks
+demo/                            fictional scans, registry and demo runner
+tools/evaluate_recognition.py    measurement stand for real scan folders
+tests/                           pytest suite (unit, GUI, cmd.exe launchers, OCR)
+```
+
+## Development
 
 ```cmd
-setup.bat --unattended
-setup.bat --core-only
-```
-
-- `--unattended` — без вопросов, без системных установок (Python, Tesseract, VC++ Runtime) и без ожидания клавиши; в `.venv` устанавливаются только Python-пакеты. Код `0` возвращается, только если готовы пакеты, Tesseract и `deu`; иначе — конкретный ненулевой код. Это изменение прежнего поведения: раньше `--unattended` был синонимом `--core-only` и завершался успешно без OCR.
-- `--core-only` — сохранён для совместимости: только Python-пакеты, Tesseract не проверяется, итоговое сообщение предупреждает, что обработка требует Tesseract с `deu`. Код `0` при готовых пакетах.
-- `--no-pause` — для автоматизации: не ждать клавишу в конце (можно сочетать с другими параметрами).
-
-#### Если Python отсутствует
-
-Setup ищет Python 3.10–3.15 в таком порядке: `py -3.14`, `%LOCALAPPDATA%\Programs\Python\Python314\python.exe`, `py -3`, `python` из `PATH`. Кандидат принимается, только если действительно запускается и сообщает подходящую версию: заглушка Microsoft Store (`WindowsApps\python.exe`, код `9009`) Python не считается. Если найден только более новый Python, setup сообщает «nicht unterstuetzte Version» и предлагает закреплённую версию. Колёса `PyMuPDF`, `Pillow`, `pdfplumber`, `pypdfium2` и их зависимостей проверены `pip download --only-binary=:all:` 2026-10-08 для 3.10, 3.14 и 3.15 (`win_amd64`), а для 3.14 — ещё для `win32` и `win_arm64`.
-
-Если подходящего Python нет, интерактивный setup после явного согласия (`[j/N]`) запускает `install_python.ps1`:
-
-- загружает с python.org закреплённый установщик **Python 3.14.8 (64-bit)**: `https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe`;
-- перед запуском проверяет подпись Authenticode: статус `Valid`, издатель `CN=Python Software Foundation`; иначе файл удаляется и не запускается;
-- устанавливает тихо только для текущего пользователя в `%LOCALAPPDATA%\Programs\Python\Python314`: `/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 AssociateFiles=0 Shortcuts=0 Include_tcltk=1 Include_pip=1 Include_doc=0 Include_test=0`; права администратора не нужны, `PATH` не меняется. Журнал установщика — `.launcher-logs\python-installer.log`;
-- затем setup находит установленный интерпретатор по этому пути и продолжает установку.
-
-Лаунчер `py` не ставится намеренно: его вариант «только для пользователя» добавляет свою папку в начало пользовательского `PATH` (компонент `launcher_path_cu` установщика CPython) и перекрывал бы команду `py` нового [Python install manager](https://docs.python.org/3/using/windows.html#python-install-manager). Классический установщик выпускается для 3.14 и 3.15, начиная с 3.16 python.org оставляет только Python install manager — при переходе на новую версию закрепление придётся пересмотреть. Автоматическая загрузка интерпретатора через install manager в лаунчерах отключена (`PYTHON_MANAGER_AUTOMATIC_INSTALL=false`).
-
-Отказ, ошибка загрузки (`70` во внутреннем журнале), неверная подпись (`71`), ошибка установщика (`72`) или отсутствие `python.exe` после установки (`73`) — прежняя инструкция для ручной установки, предложение открыть [страницу Python для Windows](https://www.python.org/downloads/windows/) и код `10`. Автоматическая установка предлагается только на 64-битной Windows для процессоров Intel/AMD; на 32-битной Windows и ARM64 setup сообщает об этом и предлагает ручную установку. `--unattended` и `--core-only` Python не устанавливают.
-
-Коды возврата `bootstrap.py` и BAT:
-
-- `0` — готово;
-- `2` — `quick_start.bat`: нет `.venv`;
-- `10` — не найден поддерживаемый Python;
-- `20` — отсутствует или повреждён обязательный пакет (`pdfplumber`, `PyMuPDF`, `Pillow`);
-- `21` — недоступен tkinter/Tcl;
-- `22` — ошибка импорта приложения;
-- `23` / `24` — не читается `subjects_config.json` / `Schuler.csv`; файлы не изменяются, пакеты не переустанавливаются;
-- `31` — не найден Tesseract;
-- `32` — отсутствуют языковые данные `deu` или `eng`;
-- `33` — общая ошибка проверки OCR;
-- `34` — PyMuPDF не загружается из-за Windows Runtime/DLL (Microsoft VC++);
-- `35` — другая ошибка импорта PyMuPDF;
-- `40` — изменился `requirements.txt` или нет штампа;
-- `50` — ошибка bootstrap, файлов окружения или диагностики, в том числе неудачный запуск процесса GUI;
-- `51` — программа лежит на сетевом пути (UNC);
-- `52` — setup прерван пользователем из-за расположения в OneDrive;
-- `64` — неверный аргумент BAT.
-
-Внутренние коды `install_python.ps1` (`70`–`73`) пишутся только в журнал setup; наружу setup возвращает `10`.
-
-Код `30` (прежний «не установлен необязательный PyMuPDF») больше не выдаётся и не будет занят другим смыслом: отсутствие PyMuPDF теперь даёт `20`. Setup возвращает `31`–`33`, когда пакеты готовы, а OCR нет; `start_app.bat` и `quick_start.bat` в этой ситуации запускают GUI. Ошибки `pip` передаются без замены кода. Код выхода самого GUI лаунчеры больше не передают: GUI работает отдельным процессом (см. «Обычный запуск»). Подробности сохраняются в UTF-8 в `.launcher-logs\setup.log`, `.launcher-logs\start_app.log` и `.launcher-logs\gui.log`. При запуске из консоли код доступен через `%ERRORLEVEL%`.
-
-### Обычный запуск
-
-```cmd
-start_app.bat
-```
-
-Это основной ежедневный запуск. Он использует только `.venv`, сверяет штамп `requirements.txt`, проверяет пакеты и данные и ремонтирует окружение лишь при проблеме Python-пакетов: при изменённом `requirements.txt` — одна обычная установка и новый штамп, при повреждённом пакете (`20`, `22`, `35`) — одна принудительная переустановка с повторной проверкой. Ошибки `subjects_config.json`, `Schuler.csv` и tkinter/Tcl не запускают `pip`. Ошибка VC++ Runtime (`34`) тоже не лечится `pip`: лаунчер завершается с кодом `34` и предлагает запустить `setup.bat`.
-
-Отсутствие Tesseract никогда не вызывает `pip` и ремонт. Лаунчер выводит предупреждение, GUI открывается, на вкладке `Verarbeitung` журнал и строка состояния сообщают, что обработка заблокирована, а кнопка запуска показывает причину и не начинает обработку. После установки Tesseract перезапуск не нужен: доступность проверяется заново при следующем запуске обработки.
-
-После успешных проверок лаунчер запускает GUI отдельным процессом через `.venv\Scripts\pythonw.exe` и сразу завершается: окно консоли видно только во время проверок и ремонта, его закрытие больше не завершает приложение. Вывод и ошибки GUI пишутся в `.launcher-logs\gui.log` (перезаписывается при каждом запуске); если GUI не может стартовать, дополнительно показывается окно сообщения. При ошибке лаунчера, запущенного двойным щелчком или ярлыком, окно консоли ждёт нажатия клавиши; `--no-pause` отключает ожидание.
-
-Второй запуск при уже открытом окне (например, повторный двойной щелчок по ярлыку) не открывает второй экземпляр, работающий с теми же файлами: появляется сообщение `PDF Datei Umbenenner ist bereits geöffnet`, после `OK` открытое окно разворачивается и выводится на передний план. Блокировка — именованный мьютекс Windows на каталог программы; он исчезает вместе с процессом, поэтому после сбоя ничего не нужно удалять вручную. Копии программы в других каталогах друг другу не мешают.
-
-Окно открывается размером 1200×760 по центру рабочей области экрана. Если оно не помещается (например, 1366×768 или 1920×1080 при масштабе 150 %, то есть около 1280×720 логических точек), окно разворачивается на весь экран, декоративный заголовок над вкладками скрывается, а список найденных учеников на вкладке `Prüfung` уменьшается так, что все поля и кнопки остаются видимыми. Поддержку высокого DPI приложение не объявляет: при масштабе 125/150 % Windows масштабирует окно целиком (текст чуть менее чёткий, раскладка та же, что при 100 %). Иконка программы (`app_icon.ico`) показывается в заголовке, в диалогах и на панели задач; собственный AppUserModelID не даёт Windows группировать окно с другими программами на Python.
-
-Проверка лаунчера без открытия GUI (код `0`, если приложение может стартовать; отсутствие OCR — только предупреждение):
-
-```cmd
-start_app.bat --health-only
-```
-
-### Быстрый запуск
-
-```cmd
-quick_start.bat
-```
-
-`quick_start.bat` ничего не устанавливает и не ремонтирует. Он проверяет только наличие `.venv` (иначе код `2`) и импорт обязательных пакетов (`bootstrap.py check-packages`, около 0,3 с; иначе понятная ошибка и код `20`, `34` или `35`), затем так же запускает GUI отдельным процессом через `pythonw.exe` и завершается. Tesseract в консоли не проверяется: GUI сам показывает предупреждение и блокирует обработку. При ошибке, если лаунчер запущен двойным щелчком, окно ждёт клавишу (`--no-pause` отключает). Если окружение неисправно, используйте `start_app.bat`.
-
-Ярлыки создаёт `create_desktop_shortcut.bat` (setup предлагает его запустить): `PDF Datei Umbenenner` на рабочем столе (с учётом перенаправления рабочего стола в OneDrive) и в меню «Пуск» текущего пользователя. Ярлык указывает на `start_app.bat`, сохраняет рабочий каталог приложения и использует иконку `app_icon.ico`; пробелы и специальные символы в пути поддерживаются. Если PowerShell или Windows Script Host запрещены политикой либо папка недоступна для записи, выводится понятное сообщение с ручным способом («Senden an → Desktop»). Активация `.venv` вручную не требуется.
-
-### Обновление существующей установки
-
-1. Закройте приложение.
-2. Замените файлы программы (`*.py`, `*.bat`, `requirements*.txt`, `install_vc_runtime.ps1`, `install_python.ps1`, `app_icon.ico`, `app_icon.png`, `README.md`). Не перезаписывайте пользовательские данные: `Schuler.csv`, `Lehrer.csv`, `student_aliases.json`, `subjects_aliases.json`, `manual_review.json`. `subjects_config.json` новой версии содержит `Informatik` и алиас `Sachunt.`; если вы меняли список предметов локально, сохраните свой файл и добавьте эти значения вручную или кнопкой `Neues Fach übernehmen` в окне проверки. Устаревший `requirements-ocr.txt` можно удалить.
-3. Запустите `start_app.bat`: изменённый `requirements.txt` (теперь с PyMuPDF и Pillow) обнаруживается по штампу, пакеты устанавливаются один раз. Лаунчеры и setup не изменяют CSV, JSON, очередь и сканы.
-4. Если Tesseract с `deu` ещё не установлен, установите его и проверьте `setup.bat` или `bootstrap.py check-ocr`.
-
-## Работа в GUI
-
-На вкладке `Verarbeitung`:
-
-1. выберите входной каталог;
-2. выберите `Monat` и `Jahr`;
-3. при необходимости включите `Testmodus (keine Änderungen)`;
-4. нажмите `Verarbeitung starten`.
-
-Настройки фиксируются в начале пакета. Во время обработки каталог, период и операции изменения справочника блокируются. Кнопка `Stoppen` завершает текущий PDF и останавливается между файлами. Закрытие окна во время пакета предлагает такое же безопасное завершение.
-
-Dry-run возвращает полный план, но не перемещает PDF, не изменяет `Schuler.csv`/алиасы и не сохраняет `manual_review.json`.
-
-## Неизвестный ученик и вкладка `Prüfung`
-
-Ученик опознаётся по всем чтениям поля имени (OCR страницы, OCR фрагмента, текстовый слой PDF):
-
-- точное имя или подтверждённый алиас в любом чтении — точное совпадение, если другое чтение не указывает на другого ученика и дата рождения не противоречит;
-- иначе имя исправляется автоматически, только если поле найдено по структуре формуляра, чтение отличается от одного ученика лишь типичными путаницами OCR (`i/l/1`, `t/l`, `o/a`, `rn/m` и т.п.), сходство не ниже 0,85 (каждая часть имени не ниже 0,75), отрыв от следующего кандидата не меньше 0,25 и ничто не противоречит; при совпадении сохранённой даты рождения допускаются до двух настоящих правок;
-- вставка или замена «настоящей» буквы (`Maximilian`/`Maximiliane`, `Anne`/`Anna`) считается возможным другим человеком и требует проверки.
-
-Автоисправление отмечается в результате (что прочитано, какой номер выбран) и не создаёт алиасов. Если ученик не опознан, PDF направляется в `manual_check`, а запись атомарно сохраняется в `manual_review.json` вместе с ранжированными кандидатами (`student_candidates`) и предложением нового ученика из распознанных фамилии, имени и даты рождения (`new_student_proposal`). Если очередь сохранить невозможно, приложение пытается вернуть PDF на исходное место и показывает явную ошибку.
-
-Вкладка `Prüfung` построена так, чтобы типичная проверка решалась одним действием:
-
-- слева под списком файлов показываются фрагменты исходного скана — имя, дата рождения и первые строки `Fach` (для старых записей без рамок полей — уменьшенная страница); кнопка «PDF öffnen» открывает файл во внешней программе;
-- строка «Status» коротко называет, что нужно решить: новый ученик, похожий ученик, несколько кандидатов, расхождение даты рождения, неизвестный или противоречивый предмет;
-- поиск ученика работает по мере ввода (части фамилии, имени или номер в любом порядке, без учёта регистра); без запроса сначала идут предложенные кандидаты (★) в порядке сходства; если обычных совпадений нет, ≈ отмечает похожие имена;
-- явно лидирующий кандидат выбран заранее, и кнопка «Ausgewählten Schüler übernehmen» применяет решение; Enter и стрелки только выбирают ученика, Escape очищает поиск; после изменения запроса или документа прежний выбор не применяется;
-- для нового ученика фамилия, имя и дата рождения уже подставлены из распознавания; «Als neuen Schüler anlegen» добавляет ученика (с датой) и применяет переименование;
-- если предмет предложен как новый, кнопка «Neues Fach übernehmen» после подтверждения добавляет его в `subjects_config.json` (атомарно, остальные записи сохраняются); парсер и проверка видят его без перезапуска. Список противоречащих значений («Deutsch, Englisch») никогда не сохраняется как алиас;
-- «Nur umbenennen» переименовывает PDF без изменения справочника после отдельного подтверждения.
-
-Дата рождения из поля формы сохраняется для выбранного или нового ученика, если в справочнике её ещё нет. После добавления нового ученика или сохранения алиаса следующее такое же распознавание находится автоматически. Поэтому неизвестного ученика обычно требуется подтвердить один раз.
-
-Для найденной записи фамилия и имя заполняются из отдельных полей справочника,
-включая составные фамилии. Открытие PDF и применение исправления используют каталог
-загруженной очереди; ввод другого каталога для следующего пакета не меняет назначение
-уже показанной карточки. Период берётся из записи очереди. Только для старых записей
-без месяца или года недостающие значения берутся из настроек GUI. Перед перемещением
-PDF приложение дожидается окончания рендера его фрагментов, чтобы файл не был занят.
-
-Справочник и алиасы сохраняются до перемещения PDF. При частичной ошибке запись
-остаётся в очереди; повторное применение не добавляет того же ученика повторно.
-Если сохранить удаление из очереди не удалось, PDF возвращается на прежнее место.
-При невозможности отката запись обновляется фактическим путём PDF и выполняется
-повторная попытка сохранить очередь. Ошибка показывает, какой этап не завершён.
-
-Если при переносе между дисками не удалось удалить исходник, приложение пытается
-удалить созданную копию. Если и это не удалось, сообщение содержит обе причины
-и оба пути: исходник сохраняется, но целевую копию нужно проверить перед повтором.
-При сбое атомарной записи CSV/JSON сохраняется прежний файл; если временный файл
-также не удалось удалить, его путь и обе ошибки включаются в диагностику.
-
-Неизвестный предмет, конфликтующие значения в столбце `Fach` и несколько разных предметов вопреки контракту также требуют ручной проверки. Исправленный вариант предмета может быть сохранён в `subjects_aliases.json` и сразу учитывается при чтении таблицы. Если неизвестное значение одинаково напечатано в нескольких строках `Fach`, запись очереди содержит его как предложение нового предмета (`subject_proposal`).
-
-Отсутствие одной опорной надписи (`Dauer`, `Ort`, `Name der Lehrkraft`, `Geburtsdatum`) не блокирует документ, если область восстановлена и содержимое поля согласовано (предмет минимум в трёх строках без других значений); такое замечание выводится как предупреждение результата. Для каждого поля в очереди сохраняются доказательства: прочитанные варианты (OCR страницы, OCR фрагмента поля, текстовый слой), рамка на странице и причины неопределённости.
-
-## Справочник `Schuler.csv`
-
-Вкладка `Schüler` (со столбцом и полем `Geburtsdatum`) позволяет:
-
-- искать и фильтровать записи;
-- создавать и редактировать ученика;
-- активировать или деактивировать запись без физического удаления истории;
-- просматривать и удалять ошибочные алиасы;
-- искать потенциальные дубликаты;
-- импортировать обновлённый CSV.
-
-Необязательный столбец `Geburtsdatum` (`TT.MM.JJJJ`, пустая ячейка - неизвестно) служит дополнительным ключом опознания: совпадение усиливает решение, уверенно прочитанная другая дата запрещает автоматическое решение даже при точном имени (одна путаница похожих цифр вроде 5/6 противоречием не считается). Дата заполняется автоматически только для ученика без даты: по документу с точным именем или подтверждённым алиасом и согласованным чтением даты, а также при решении оператора в `Prüfung`. Существующая дата не перезаписывается; столбец добавляется с резервной копией CSV. Справочник с датами рождения - персональные данные и остаётся только локальным.
-
-Поддерживаются UTF-8/UTF-8 BOM, заголовки `Vorname` и исторический `Forname`, необязательные `Aktiv` и `Geburtsdatum`, а также `;`, `,`, табуляция и `|` при импорте. Перед применением показывается diff:
-
-- новые записи;
-- неизменённые записи;
-- конфликты номеров или имён;
-- дубликаты;
-- записи, отсутствующие в новом файле.
-
-Применение требует явного подтверждения. Добавляются только новые бесконфликтные строки; конфликты и дубликаты не перезаписываются, отсутствующие исторические записи не удаляются. Перед массовым изменением создаётся `Schuler.csv.bak` (при повторении - следующий свободный суффикс), а итоговый CSV заменяется атомарно. Matcher обновляется без перезапуска приложения.
-
-Поиск дублей, чтение и применение импорта выполняются в фоновом потоке с индикатором ожидания. На время операции другие изменения справочника и запуск обработки PDF недоступны. В предпросмотре видны статус активности и номера исходных строк с конфликтами. Исправления существующих учеников выполняются кнопкой `Bearbeiten`.
-
-Если CSV или файл алиасов изменён вне приложения, перед сохранением нажмите `Aktualisieren`: кнопка перечитывает оба файла и обновляет matcher. После изменения справочника или алиасов нужно заново открыть предпросмотр импорта. Проверка внешних изменений не заменяет блокировку файлов между несколькими одновременно работающими экземплярами приложения.
-
-При одновременном наличии `Forname` и `Vorname` их значения должны совпадать после нормализации регистра и пробелов. Неполные строки, противоречивые имена и некорректные номера отклоняются. Отсутствие столбца `Aktiv` означает активный статус во входящем списке; отличие от сохранённого статуса показывается как конфликт и не меняется автоматически.
-
-Минимальные поддерживаемые колонки:
-
-```csv
-Nummer;Nachname;Vorname
-1;Beispiel;Lena
-```
-
-Опциональная колонка `Aktiv` принимает логические значения, поддерживаемые приложением.
-
-Сервис `student_registry.StudentRegistry` не зависит от GUI. После парсера вызывайте
-`match(parsed.raw_name)`: результат `StudentMatch` содержит `status`, `student`,
-`suggestions`, `ranked_suggestions`, `reason` и `requires_manual_review`.
-Статусы — `exact`, `unknown`, `ambiguous`, `error`. Только `exact` содержит выбранного
-ученика; похожие варианты требуют ручного выбора. Ошибка чтения CSV или алиасов
-возвращается как `error` с диагностикой, без остановки всего пакета.
-
-`match()` учитывает оба порядка полного имени и подтверждённые алиасы.
-`match_parts(last_name, first_name)` проверяет канонические поля с сохранением их
-границ. Нормализация использует NFC, регистр и пробелы; дефисы, апострофы и
-диакритика остаются значимыми. Неактивные записи также участвуют в сопоставлении.
-
-Изменения выполняются только явными вызовами:
-
-- `select_existing(number)` — выбрать запись без сохранения;
-- `confirm_existing(raw_name, number, save_alias=True)` — подтвердить выбор и
-  запомнить написание; `save_alias=False` оставляет файлы без изменений;
-- `confirm_new(last_name, first_name)` — добавить ученика с номером `max(Nummer) + 1`;
-- `update_student(number, ...)` — изменить имя или активность, сохранив номер и алиасы.
-
-Алиасы хранятся рядом с CSV в `student_aliases.json`:
-
-```json
-{"version": 1, "aliases": [{"name": "Beispie1 Lena", "student_number": 1}]}
-```
-
-Старый формат `{"aliases": {"Beispie1 Lena": 1}}` читается без изменений и
-преобразуется при следующей записи после создания резервной копии.
-CSV сохраняет дополнительные колонки, их порядок и наличие BOM. Конфликты имён
-с алиасами отклоняются до записи. Ошибки изменений возвращаются через
-`RegistryValidationError`, `RegistryUnavailableError` или `RegistryWriteError`.
-
-## OCR
-
-Каждая первая страница распознаётся OCR: текстовый слой сканера часто испорчен, поэтому он используется только как второе чтение и как запасной вариант, если OCR для документа не удался. Для обработки нужны:
-
-- `PyMuPDF` для рендера первой страницы (входит в `requirements.txt`);
-- отдельно установленный Tesseract;
-- языковые данные `deu` и `eng`; `osd` (входит в стандартную установку Tesseract) помогает распознать боковую ориентацию страницы.
-
-Без доступного OCR GUI запускается, справочник и очередь проверки работают, но пакетная обработка, в том числе dry-run, не стартует и показывает причину. Если структура формуляра не найдена ни в одном чтении, страница один раз распознаётся повторно в повороте, который подсказывает OSD, или вверх ногами.
-
-Установка Tesseract описана в разделе «Установка Tesseract». Диагностика `check-ocr`: `0` — готово (без `osd` — предупреждение `OCR_WARNING_OSD_MISSING`), `31` / `32` / `33` — нет Tesseract / языков / ошибка проверки, `20` / `34` / `35` — проблема PyMuPDF.
-
-Проверка:
-
-```cmd
-.venv\Scripts\python.exe bootstrap.py check-ocr
-```
-
-Если OCR не удался для отдельного документа (ошибка рендера, timeout), документ направляется на ручную проверку с диагностикой и имеющимся текстовым слоем. OCR рассчитан на печатные поля; надёжное чтение рукописного текста не обещается. Низкая уверенность имени или предмета запрещает автоматическое переименование.
-
-## Резервные копии и восстановление
-
-CSV и JSON приложения записываются через временный файл, `fsync` и атомарную замену. Повреждённые `manual_review.json` и файлы алиасов открываются в fail-closed режиме: приложение сообщает ошибку и не перезаписывает исходный файл как пустой.
-
-Перед ручным восстановлением:
-
-1. закройте приложение;
-2. скопируйте повреждённый файл и каталог `manual_check` в резервное место;
-3. сопоставьте каждый PDF с записью очереди;
-4. только после этого исправьте JSON либо создайте новую пустую очередь `{"review_items": []}`.
-
-Если локальное окружение повреждено, закройте приложение и запустите `start_app.bat`. При неработающем Python прежнее `.venv` сохраняется в `.bootstrap\venv-backup-<идентификатор>`, затем создаётся новое. Если создание не удалось, резервная копия остаётся на месте. Пользовательские PDF, CSV и JSON не изменяются. Каталоги `.venv`, `.bootstrap` и `.launcher-logs` исключены из Git; резервные копии пользовательских CSV/JSON не скрываются общими масками `*.bak` и `*.tmp`.
-
-Для полного ручного сброса после закрытия приложения можно удалить только каталог
-`.venv` и повторить `setup.bat`. Системный Tesseract устанавливается отдельно;
-удаление `.venv` его не удаляет.
-
-## CLI
-
-CLI требует явных месяца и года:
-
-```cmd
-.venv\Scripts\python.exe main.py C:\PDF-Eingang --month 4 --year 2028
-```
-
-Безопасный dry-run:
-
-```cmd
-.venv\Scripts\python.exe main.py C:\PDF-Eingang --month 4 --year 2028 --dry-run
-```
-
-При ошибке отдельного PDF пакет продолжает работу. Ошибки обработки или сохранения очереди дают код возврата `2`, чтобы автоматизация и BAT-файлы не считали такой запуск успешным. Без доступного OCR обработка не начинается: код `3`.
-
-### API конвейера обработки
-
-`DocumentProcessingService` в `processing_service.py` используется CLI и GUI.
-Зависимости извлечения, парсера, справочника, валидатора, очереди и переименования
-передаются в конструктор. `process_document(path, month, year, dry_run=False)`
-возвращает `ProcessingResult`; `process_batch(paths, month, year, dry_run=False)`
-начинает новый пакет резервирования имён и возвращает `BatchProcessingResult`.
-
-Результат содержит завершённые стадии, извлечённые и канонические данные,
-сопоставление ученика, валидацию предмета, предупреждения и план действия.
-`planned_path` / `planned_name` и `review_item` сохраняются и при сбое выполнения.
-`failed_stage` указывает стадию ошибки, `actual_path` — текущий путь PDF,
-`performed_action` — выполненное действие. Проверяйте `error`: при неудачном
-сохранении очереди и невозможности отката PDF может остаться в `manual_check`,
-даже если весь результат завершился ошибкой. В этом случае запись для
-восстановления сохраняется в памяти, а пакет повторяет сохранение очереди.
-
-Имена строятся из канонических фамилии/имени, предмета и явно выбранного периода.
-Статусы `unknown` и `ambiguous` направляются на проверку с подсказками; автоматическая
-обработка не добавляет учеников в CSV. Пути в очереди отсчитываются от папки её JSON.
-Старые записи очереди загружаются без новых полей; месяц и год для них остаются
-неопределёнными до явного выбора в интерфейсе.
-
-Планировщик учитывает существующие имена и резервирования текущего пакета, выбирая
-первый свободный суффикс `_1`, `_2`, … . Состав исходной и целевой папок фиксируется
-при первом планировании операции с ними; освободившиеся имена остаются занятыми
-до конца пакета. Поэтому повторный dry-run и реальный запуск на тех же входных
-данных выбирают одинаковые цели. Ручная коррекция использует тот же планировщик.
-В dry-run возвращается план без перемещения PDF, записи CSV/JSON и изменения
-очереди в памяти. Счётчики пакета не включают неудачные операции в успешные планы.
-
-## Health-check и тесты
-
-```cmd
-.venv\Scripts\python.exe bootstrap.py check-packages
-.venv\Scripts\python.exe bootstrap.py check-core
-.venv\Scripts\python.exe bootstrap.py check-ocr
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .venv\Scripts\python.exe -m pytest
 ```
 
-`check-packages` проверяет только обязательные пакеты, `check-core` — пакеты, tkinter, импорт приложения и данные, `check-ocr` — Tesseract и языки. Реальный OCR-тест автоматически пропускается, если Tesseract, PyMuPDF или нужные языковые данные отсутствуют.
+The suite covers the pipeline, the GUI on real Tk widgets, the BAT launchers in a real `cmd.exe` and an end-to-end OCR run on the demo scans (skipped if Tesseract is missing). See [Development](docs/en/development.md) for the architecture, the CLI and the measurement stand.
 
-Результаты прежней финальной проверки описаны в
-[отчёте этапа 8](instructions/REPORT_end_to_end_qa.md). Текущая доработка распознавания
-ведётся по [серии scan_recognition_v3](instructions/implementation_prompts/scan_recognition_v3/README.md);
-её состояние и замеры стенда — в `STATUS.md` серии.
+## License
 
-### Стенд измерения качества распознавания
+The source code is released under the [MIT License](LICENSE). © 2025–2026 Konstantin Shakun.
 
-Стенд прогоняет конвейер CLI в dry-run и сравнивает каждое решение с локальным эталоном:
-
-```cmd
-.venv\Scripts\python.exe tools\evaluate_recognition.py Scans
-.venv\Scripts\python.exe tools\evaluate_recognition.py <папка переименованных PDF> --from-filenames
-```
-
-Эталон — либо `_expected.csv` в папке сканов (`Datei;Nachname;Vorname;Fach`, предмет каноническим названием), либо имена уже переименованных PDF. Стенд считает правильные и **ошибочные** автоматические решения, оправданные проверки (ученика нет в справочнике или предмета нет в списке), лишние проверки, ошибки и время на документ. Параметр `--registry` подставляет другой справочник, например временную копию; `--report` дополнительно сохраняет таблицу в файл.
-
-Код возврата: `0` — ошибочных решений нет, `1` — есть ошибочные автоматические решения, `2` — ошибка параметров или эталона, `3` — во время прогона изменились PDF или данные. Эталон и отчёты содержат имена, поэтому `_expected.csv` и `recognition_report*` исключены через `.gitignore`.
-
-## Данные и Git
-
-`Schuler.csv`, `Lehrer.csv`, `manual_review.json`, `subjects_aliases.json` и PDF в `scans` могут содержать персональные или операционные данные. Не используйте реальные данные в примерах, публичных issue и тестовых фикстурах.
-
-`Schuler.csv` (и его резервные копии), `Lehrer.csv`, `student_aliases.json`, `manual_review.json` в корне проекта и папка `scans` не входят в репозиторий: они исключены через `.gitignore` и хранятся только локально. Реальные сканы и реестры удалены и из истории Git. Перед коммитом проверяйте, что в индекс не попали новые файлы с персональными данными.
-
-## Основные файлы
-
-- `processing_service.py` - единая бизнес-логика обработки документа;
-- `gui_main.py` - основной GUI;
-- `gui_minimal.py` - совместимый тонкий запускатель того же GUI;
-- `main.py` - CLI-адаптер;
-- `form_parser.py` - определение и парсинг двух формуляров;
-- `student_registry.py` и `student_registry_service.py` - сопоставление, CRUD и импорт учеников;
-- `review_actions.py` и `review_queue.py` - ручное подтверждение и durable queue;
-- `ocr.py` и `pdf_extractor.py` - OCR первой страницы и текстовый слой как второе чтение;
-- `bootstrap.py` и BAT-файлы - окружение и запуск;
-- `install_python.ps1` - установка Python по согласию с проверкой подписи;
-- `start_gui.py` и `desktop_integration.py` - запуск GUI без консоли, один экземпляр, иконка и размер окна;
-- `app_icon.png` / `app_icon.ico` - иконка программы (исходник и набор 16–256 px).
+Third-party components keep their own licenses: [PyMuPDF](https://pymupdf.readthedocs.io/) is dual-licensed under **AGPL-3.0** or a commercial license by Artifex — it is installed separately by `pip`, but if you distribute the program together with PyMuPDF, the AGPL terms apply to that distribution. pdfplumber, pdfminer.six and Pillow are MIT-style licensed, pypdfium2 is Apache-2.0/BSD-3-Clause, and [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) is Apache-2.0.

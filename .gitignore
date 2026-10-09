@@ -52,3 +52,9 @@ bootstrap-*.tmp
 # Local recognition reference and stand reports (contain names)
 _expected.csv
 recognition_report*
+
+# Local development notes (not published)
+/instructions/
+
+# Output of demo/run_demo.py
+/demo/output/

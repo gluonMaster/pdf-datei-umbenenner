@@ -64,7 +64,7 @@ echo.
 echo Rueckgabecodes: 0 bereit; 10 Python fehlt; 31 Tesseract fehlt; 32 Sprachdaten deu
 echo oder eng fehlen; 33 OCR-Pruefung fehlgeschlagen; 34 Microsoft VC++ Laufzeit fuer
 echo PyMuPDF fehlt; 51 Netzwerkpfad; 52 Abbruch wegen OneDrive-Ordner.
-echo Alle Codes stehen in README.md.
+echo Alle Codes stehen in docs\de\installation.md.
 exit /b 0
 
 :arguments_done
